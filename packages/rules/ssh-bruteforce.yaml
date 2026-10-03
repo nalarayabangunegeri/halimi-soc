@@ -1,0 +1,21 @@
+id: ssh-bruteforce
+version: 1
+name: SSH Brute Force
+description: Repeated failed SSH authentication from one source address
+severity: high
+
+match:
+  types:
+    - auth.ssh.login_failed
+    - auth.ssh.invalid_user
+  outcomes:
+    - failure
+
+threshold:
+  count: 5
+  window: 60s
+
+group_by:
+  - network.src_ip
+
+cooldown: 5m

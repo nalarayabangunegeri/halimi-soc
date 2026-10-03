@@ -1,0 +1,29 @@
+# HalimiSOC TLS termination (Caddy).
+#
+# The Go API speaks plain HTTP by design and the browser must never reach it
+# directly: the console (web:3000) is the only user-facing surface, and it
+# reaches the API over the compose network. Point this file at your hostname,
+# add it to the compose stack, and keep ports 8080/3000 on loopback.
+#
+# See docs/security/configuration.md for the hardening checklist this fronts.
+
+halimisoc.example.test {
+	# The console sets HttpOnly, Secure cookies itself; the proxy only needs
+	# to terminate TLS and forward.
+	reverse_proxy web:3000
+
+	header {
+		# Defence in depth behind the console's own per-request CSP nonce.
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		# HSTS: enable only once TLS is confirmed working, or a misconfiguration
+		# bricks the hostname in browsers until max-age expires.
+		# Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

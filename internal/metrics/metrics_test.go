@@ -1,0 +1,125 @@
+package metrics_test
+
+import (
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/halimi/halimisoc/internal/metrics"
+)
+
+func TestCounterAndGauge(t *testing.T) {
+	r := metrics.New()
+
+	r.Inc(metrics.DetectionTotal)
+	r.Inc(metrics.DetectionTotal)
+	r.Add(metrics.EventsReceivedTotal, 5)
+	r.Set(metrics.QueueDepth, 12)
+
+	if got := r.Counter(metrics.DetectionTotal); got != 2 {
+		t.Errorf("detection_total = %v, want 2", got)
+	}
+	if got := r.Counter(metrics.EventsReceivedTotal); got != 5 {
+		t.Errorf("events_received_total = %v, want 5", got)
+	}
+	if got := r.Gauge(metrics.QueueDepth); got != 12 {
+		t.Errorf("queue_depth = %v, want 12", got)
+	}
+	// An unset series reads as zero rather than panicking.
+	if got := r.Counter("never_recorded"); got != 0 {
+		t.Errorf("unset counter = %v, want 0", got)
+	}
+}
+
+func TestLabelsProduceDistinctSeries(t *testing.T) {
+	r := metrics.New()
+	r.Inc(metrics.EventsDroppedTotal, metrics.L("reason", "EVENT_MALFORMED"))
+	r.Inc(metrics.EventsDroppedTotal, metrics.L("reason", "EVENT_MALFORMED"))
+	r.Inc(metrics.EventsDroppedTotal, metrics.L("reason", "UNSUPPORTED_SCHEMA_VERSION"))
+
+	if got := r.Counter(metrics.EventsDroppedTotal, metrics.L("reason", "EVENT_MALFORMED")); got != 2 {
+		t.Errorf("malformed = %v, want 2", got)
+	}
+	if got := r.Counter(metrics.EventsDroppedTotal, metrics.L("reason", "UNSUPPORTED_SCHEMA_VERSION")); got != 1 {
+		t.Errorf("unsupported = %v, want 1", got)
+	}
+}
+
+func TestLabelOrderDoesNotChangeSeries(t *testing.T) {
+	r := metrics.New()
+	r.Inc("x", metrics.L("b", "2"), metrics.L("a", "1"))
+	r.Inc("x", metrics.L("a", "1"), metrics.L("b", "2"))
+
+	if got := r.Counter("x", metrics.L("a", "1"), metrics.L("b", "2")); got != 2 {
+		t.Fatalf("counter = %v, want 2; label order must not create a second series", got)
+	}
+}
+
+func TestPrometheusOutput(t *testing.T) {
+	r := metrics.New()
+	r.Inc(metrics.DetectionTotal)
+	r.Set(metrics.QueueDepth, 3)
+
+	var b strings.Builder
+	if err := r.WritePrometheus(&b); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+
+	for _, want := range []string{"detection_total 1", "queue_depth 3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrometheusEscapesLabelValues(t *testing.T) {
+	r := metrics.New()
+	r.Inc("x", metrics.L("reason", "line\nbreak\"quote"))
+
+	var b strings.Builder
+	if err := r.WritePrometheus(&b); err != nil {
+		t.Fatal(err)
+	}
+	// A raw newline would split one series into two lines and corrupt the
+	// exposition format.
+	for _, line := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+		if strings.Count(line, "{") != strings.Count(line, "}") {
+			t.Fatalf("unbalanced label braces in %q", line)
+		}
+	}
+}
+
+func TestConcurrentUseIsSafe(t *testing.T) {
+	r := metrics.New()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				r.Inc(metrics.DetectionTotal)
+				r.Set(metrics.QueueDepth, float64(j))
+				r.Counter(metrics.DetectionTotal)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := r.Counter(metrics.DetectionTotal); got != 4000 {
+		t.Fatalf("detection_total = %v, want 4000", got)
+	}
+}
+
+func TestSnapshotIsACopy(t *testing.T) {
+	r := metrics.New()
+	r.Inc(metrics.DetectionTotal)
+
+	snap := r.Snapshot()
+	snap[metrics.DetectionTotal] = 999
+
+	if got := r.Counter(metrics.DetectionTotal); got != 1 {
+		t.Fatalf("mutating the snapshot changed the registry: %v", got)
+	}
+}

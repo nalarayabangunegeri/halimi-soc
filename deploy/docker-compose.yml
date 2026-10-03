@@ -1,0 +1,91 @@
+# HalimiSOC local deployment.
+#
+# This file is for running the stack on one machine. The API is published on
+# loopback only: put a TLS-terminating reverse proxy in front of it and never
+# expose port 8080 directly, because the API itself speaks plain HTTP.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: halimisoc
+      POSTGRES_PASSWORD: ${HALIMISOC_DB_PASSWORD:?set HALIMISOC_DB_PASSWORD}
+      POSTGRES_DB: halimisoc
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Bound to loopback: the database must not be reachable from the network.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U halimisoc -d halimisoc"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/docker/api.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HALIMISOC_ENV: production
+      HALIMISOC_LISTEN_ADDR: 0.0.0.0:8080
+      HALIMISOC_DATABASE_URL: postgres://halimisoc:${HALIMISOC_DB_PASSWORD}@postgres:5432/halimisoc?sslmode=disable
+      HALIMISOC_RULES_PATH: /etc/halimisoc/rules
+      HALIMISOC_ADMIN_USER: ${HALIMISOC_ADMIN_USER:?set HALIMISOC_ADMIN_USER}
+      HALIMISOC_ADMIN_PASSWORD: ${HALIMISOC_ADMIN_PASSWORD:?set HALIMISOC_ADMIN_PASSWORD}
+      HALIMISOC_AGENT_ENROLL_SECRET: ${HALIMISOC_AGENT_ENROLL_SECRET:?set HALIMISOC_AGENT_ENROLL_SECRET}
+      HALIMISOC_SECURE_COOKIES: ${HALIMISOC_SECURE_COOKIES:-true}
+    volumes:
+      - ../packages/rules:/etc/halimisoc/rules:ro
+    ports:
+      # Publish on loopback so only the local reverse proxy can reach the API.
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/docker/web.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      # service_started, not service_healthy: the API image is `scratch` and has
+      # no shell or curl to run a health probe in. The console degrades to an
+      # error banner until the API answers, then recovers on the next request.
+      api:
+        condition: service_started
+    environment:
+      # The console reaches the API over the compose network; the browser never
+      # does. Keeping this off the host network is what lets the API stay on
+      # loopback while the console remains the only user-facing surface.
+      HALIMISOC_API_URL: http://api:8080
+      HALIMISOC_API_SECURE_COOKIES: "false"
+      HALIMISOC_WEB_SECURE_COOKIES: ${HALIMISOC_WEB_SECURE_COOKIES:-true}
+      # Set together when serving the console over plain HTTP on a trusted
+      # network; without the acknowledgement the console refuses to start.
+      HALIMISOC_WEB_ALLOW_INSECURE_COOKIES: ${HALIMISOC_WEB_ALLOW_INSECURE_COOKIES:-false}
+    ports:
+      - "127.0.0.1:3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  postgres-data:

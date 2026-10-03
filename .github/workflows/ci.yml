@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the workflow only needs to read the repository.
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: halimisoc
+          POSTGRES_PASSWORD: halimisoc_ci_password
+          POSTGRES_DB: halimisoc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U halimisoc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (race detector)
+        run: go test ./... -count=1 -race
+
+      - name: Coverage
+        run: go test ./... -count=1 -coverprofile=coverage.txt -covermode=atomic
+
+      - name: End-to-end test
+        env:
+          HALIMISOC_TEST_DATABASE_URL: postgres://halimisoc:halimisoc_ci_password@127.0.0.1:5432/halimisoc_test?sslmode=disable
+        run: go test ./tests/ -count=1 -v -timeout 300s
+
+      - name: Build both binaries
+        run: |
+          go build -trimpath -o /dev/null ./apps/api
+          go build -trimpath -o /dev/null ./apps/agent
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      # Secret scanning runs on the full history so a secret removed in a later
+      # commit is still caught.
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  web:
+    name: Console
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: halimisoc
+          POSTGRES_PASSWORD: halimisoc_ci_password
+          POSTGRES_DB: halimisoc_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U halimisoc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The end-to-end suite builds and starts the Go API from source so that it
+      # tests this commit rather than a cached binary, which means the job needs a
+      # Go toolchain as well as Node.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      # The development toolchain has advisories that are accepted and recorded in
+      # SECURITY.md; the tree that actually ships must not. Failing here means a
+      # new production dependency arrived with a known vulnerability.
+      - name: Audit production dependencies
+        working-directory: apps/web
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Typecheck
+        working-directory: apps/web
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        working-directory: apps/web
+        run: npx vitest run
+
+      - name: Production build
+        working-directory: apps/web
+        run: npm run build
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+
+      # A production build is exercised, not the dev server: the dev server has
+      # different caching and error behaviour, and the point is to check what an
+      # operator actually runs.
+      - name: End-to-end tests
+        working-directory: apps/web
+        env:
+          HALIMISOC_TEST_DATABASE_URL: postgres://halimisoc:halimisoc_ci_password@127.0.0.1:5432/halimisoc_test?sslmode=disable
+        run: npx playwright test
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -f deploy/docker/api.Dockerfile -t halimisoc-api:ci .
+
+      - name: Build agent image
+        run: docker build -f deploy/docker/agent.Dockerfile -t halimisoc-agent:ci .
+
+      - name: Build console image
+        run: docker build -f deploy/docker/web.Dockerfile -t halimisoc-web:ci .

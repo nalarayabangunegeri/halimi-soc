@@ -1,0 +1,534 @@
+package memory_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/halimi/halimisoc/internal/agents"
+	"github.com/halimi/halimisoc/internal/alerts"
+	"github.com/halimi/halimisoc/internal/audit"
+	"github.com/halimi/halimisoc/internal/auth"
+	"github.com/halimi/halimisoc/internal/authorization"
+	"github.com/halimi/halimisoc/internal/events/model"
+	"github.com/halimi/halimisoc/internal/incidents"
+	"github.com/halimi/halimisoc/internal/storage"
+	memorystore "github.com/halimi/halimisoc/internal/storage/memory"
+)
+
+func ctx() context.Context { return context.Background() }
+
+func newEvent(id, host string, at time.Time) *model.Event {
+	return &model.Event{
+		ID:            id,
+		SchemaVersion: model.SchemaVersion,
+		Type:          model.TypeSSHLoginFailed,
+		Time:          at,
+		ReceivedAt:    at,
+		Host:          host,
+		Actor:         "root",
+		Source:        model.SourceAuthLog,
+		Outcome:       model.OutcomeFailure,
+		Severity:      model.SeverityMedium,
+		Network:       model.Network{SourceIP: "203.0.113.7"},
+		Attributes:    map[string]string{"parser": "sshd"},
+		Raw:           "raw line",
+	}
+}
+
+func TestInsertEventIsIdempotent(t *testing.T) {
+	s := memorystore.New()
+	e := newEvent("evt_1", "web-01", time.Now().UTC())
+
+	inserted, err := s.InsertEvent(ctx(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("first insert reported not inserted")
+	}
+
+	inserted, err = s.InsertEvent(ctx(), e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("duplicate insert reported as new; detection would re-run")
+	}
+
+	n, err := s.CountEvents(ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("stored events = %d, want 1", n)
+	}
+}
+
+func TestStoredEventsAreIsolatedFromCallers(t *testing.T) {
+	s := memorystore.New()
+	e := newEvent("evt_1", "web-01", time.Now().UTC())
+	if _, err := s.InsertEvent(ctx(), e); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutating the caller's copy must not change stored state.
+	e.Attributes["parser"] = "tampered"
+	e.Raw = "tampered"
+
+	got, err := s.GetEvent(ctx(), "evt_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Attributes["parser"] != "sshd" || got.Raw != "raw line" {
+		t.Fatalf("stored event was mutated through the caller's pointer: %+v", got)
+	}
+}
+
+func TestGetEventNotFound(t *testing.T) {
+	s := memorystore.New()
+	if _, err := s.GetEvent(ctx(), "evt_missing"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListEventsOrderingAndPagination(t *testing.T) {
+	s := memorystore.New()
+	base := time.Date(2025, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	// Insert out of chronological order to prove ordering is by event time, not
+	// insertion order.
+	for i, id := range []string{"evt_b", "evt_a", "evt_c"} {
+		e := newEvent(id, "web-01", base.Add(time.Duration(i)*time.Minute))
+		if _, err := s.InsertEvent(ctx(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := s.ListEvents(ctx(), storage.EventQuery{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 {
+		t.Fatalf("page size = %d, want 2", len(page.Events))
+	}
+	if page.Events[0].ID != "evt_c" {
+		t.Errorf("first event = %s, want the newest", page.Events[0].ID)
+	}
+	if page.NextCursor == "" {
+		t.Fatal("expected a next cursor")
+	}
+
+	next, err := s.ListEvents(ctx(), storage.EventQuery{Limit: 2, Cursor: page.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Events) != 1 {
+		t.Fatalf("second page size = %d, want 1", len(next.Events))
+	}
+	if next.NextCursor != "" {
+		t.Errorf("unexpected cursor on the final page: %q", next.NextCursor)
+	}
+}
+
+func TestListEventsFilters(t *testing.T) {
+	s := memorystore.New()
+	base := time.Now().UTC()
+
+	a := newEvent("evt_a", "web-01", base)
+	b := newEvent("evt_b", "db-01", base)
+	b.Actor = "alice"
+	b.Network.SourceIP = "198.51.100.4"
+
+	for _, e := range []*model.Event{a, b} {
+		if _, err := s.InsertEvent(ctx(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name  string
+		query storage.EventQuery
+		want  int
+	}{
+		{"by host", storage.EventQuery{Host: "web-01"}, 1},
+		{"by actor", storage.EventQuery{Actor: "alice"}, 1},
+		{"by source ip", storage.EventQuery{SourceIP: "198.51.100.4"}, 1},
+		{"by type", storage.EventQuery{Type: model.TypeSSHLoginFailed}, 2},
+		{"by severity", storage.EventQuery{Severity: model.SeverityMedium}, 2},
+		{"by severity miss", storage.EventQuery{Severity: model.SeverityCritical}, 0},
+		{"no filter", storage.EventQuery{}, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			page, err := s.ListEvents(ctx(), tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Events) != tc.want {
+				t.Fatalf("got %d events, want %d", len(page.Events), tc.want)
+			}
+		})
+	}
+}
+
+func TestPurgeRawEvidenceKeepsStructuredEvent(t *testing.T) {
+	s := memorystore.New()
+	old := newEvent("evt_old", "web-01", time.Now().UTC().Add(-30*24*time.Hour))
+	recent := newEvent("evt_new", "web-01", time.Now().UTC())
+
+	for _, e := range []*model.Event{old, recent} {
+		if _, err := s.InsertEvent(ctx(), e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	purged, err := s.PurgeRawEvidence(ctx(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1", purged)
+	}
+
+	// The structured event survives so alert and incident references stay valid.
+	got, err := s.GetEvent(ctx(), "evt_old")
+	if err != nil {
+		t.Fatalf("structured event was removed: %v", err)
+	}
+	if got.Raw != "" {
+		t.Error("raw evidence was not cleared")
+	}
+	if got.Attributes["raw_expired"] != "true" {
+		t.Error("expiry was not marked, so the UI cannot distinguish empty from expired")
+	}
+	if got.Type != model.TypeSSHLoginFailed || got.Actor != "root" {
+		t.Error("structured fields were damaged by retention")
+	}
+
+	kept, err := s.GetEvent(ctx(), "evt_new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Raw == "" {
+		t.Error("recent raw evidence was purged too")
+	}
+}
+
+func TestAlertStatusTransition(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	a := &alerts.Alert{
+		ID: "alt_1", RuleID: "r", RuleVersion: 1, RuleName: "R",
+		Severity: model.SeverityHigh, Status: alerts.StatusOpen,
+		Title: "t", Reason: "why", EventIDs: []string{"evt_1"},
+		WindowStart: now, WindowEnd: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.SaveAlert(ctx(), a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAlert(ctx(), a); !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("duplicate alert err = %v, want ErrConflict", err)
+	}
+
+	updated, err := s.UpdateAlertStatus(ctx(), "alt_1", alerts.StatusAcknowledged, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != alerts.StatusAcknowledged {
+		t.Fatalf("status = %s", updated.Status)
+	}
+
+	// Terminal states cannot reopen.
+	if _, err := s.UpdateAlertStatus(ctx(), "alt_1", alerts.StatusOpen, now); !errors.Is(err, storage.ErrInvalidTransition) {
+		t.Fatalf("err = %v, want ErrInvalidTransition", err)
+	}
+	if _, err := s.UpdateAlertStatus(ctx(), "alt_missing", alerts.StatusResolved, now); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestAgentTokenLifecycle(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+
+	if err := s.SaveAgent(ctx(), &agents.Agent{
+		ID: "agt_1", Host: "web-01", Status: agents.StatusOnline,
+		EnrolledAt: now, LastHeartbeat: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tok := &agents.Token{ID: "tok_1", AgentID: "agt_1", TokenHash: "hash1", Prefix: "agt_ab…", CreatedAt: now}
+	if err := s.SaveToken(ctx(), tok); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetTokenByHash(ctx(), "hash1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotation invalidates the old credential, which is the point of rotating.
+	if err := s.RotateTokensForAgent(ctx(), "agt_1", now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTokenByHash(ctx(), "hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Rotated() || got.Active(now) {
+		t.Fatal("a rotated token is still active")
+	}
+
+	next := &agents.Token{ID: "tok_2", AgentID: "agt_1", TokenHash: "hash2", CreatedAt: now}
+	if err := s.SaveToken(ctx(), next); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RevokeTokensForAgent(ctx(), "agt_1", now); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := s.GetTokenByHash(ctx(), "hash2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !revoked.Revoked() || revoked.Active(now) {
+		t.Fatal("a revoked token is still active")
+	}
+}
+
+func TestSessionRevocation(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+
+	if err := s.SaveUser(ctx(), &auth.User{
+		ID: "usr_1", Username: "admin", PasswordHash: "x",
+		Role: authorization.RoleAdmin, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, _, err := auth.NewSession("usr_1", "", "", time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSession(ctx(), sess); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := s.GetSession(ctx(), sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CSRFToken != sess.CSRFToken {
+		t.Fatal("session round-trip lost the CSRF token")
+	}
+
+	if err := s.RevokeSession(ctx(), sess.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = s.GetSession(ctx(), sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Revoked() {
+		t.Fatal("session was not revoked")
+	}
+}
+
+func TestDeleteExpiredSessions(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+
+	sess, _, err := auth.NewSession("usr_1", "", "", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSession(ctx(), sess); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := s.DeleteExpiredSessions(ctx(), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+}
+
+func TestUserUsernameIsCaseInsensitive(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	if err := s.SaveUser(ctx(), &auth.User{
+		ID: "usr_1", Username: "admin", PasswordHash: "x",
+		Role: authorization.RoleAdmin, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.GetUserByUsername(ctx(), "ADMIN"); err != nil {
+		t.Fatalf("case-insensitive lookup failed: %v", err)
+	}
+
+	// A second account differing only in case must be rejected, otherwise the
+	// login form has two accounts that look identical to an operator.
+	err := s.SaveUser(ctx(), &auth.User{
+		ID: "usr_2", Username: "Admin", PasswordHash: "y",
+		Role: authorization.RoleAnalyst, CreatedAt: now,
+	})
+	if !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestRecordLogin(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	if err := s.SaveUser(ctx(), &auth.User{
+		ID: "usr_1", Username: "admin", PasswordHash: "x",
+		Role: authorization.RoleAdmin, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RecordLogin(ctx(), "usr_1", now); err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.GetUser(ctx(), "usr_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.LastLoginAt == nil {
+		t.Fatal("last login was not recorded")
+	}
+	if err := s.RecordLogin(ctx(), "usr_missing", now); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestIncidentPersistence(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	inc := &incidents.Incident{
+		ID: "inc_1", Title: "t", Summary: "s",
+		Severity: model.SeverityHigh, Status: incidents.StatusNew,
+		Hosts: []string{"web-01"}, Actors: []string{"root"},
+		AlertIDs: []string{"alt_1"}, EventIDs: []string{"evt_1"},
+		Stages:    []incidents.Stage{{Name: incidents.StageInitialAccess, At: now}},
+		FirstSeen: now, LastSeen: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.SaveIncident(ctx(), inc); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetIncident(ctx(), "inc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Stages) != 1 || got.Stages[0].Name != incidents.StageInitialAccess {
+		t.Fatalf("stages did not round-trip: %+v", got.Stages)
+	}
+
+	// Terminal incidents must not appear as open candidates for correlation.
+	inc.Status = incidents.StatusResolved
+	if err := s.SaveIncident(ctx(), inc); err != nil {
+		t.Fatal(err)
+	}
+	open, err := s.ListOpenIncidents(ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open incidents = %d, want 0", len(open))
+	}
+}
+
+func TestAuditAppendAndList(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		if err := s.AppendAudit(ctx(), &audit.Entry{
+			ID: "audit_" + string(rune('a'+i)), Actor: "user:admin",
+			Action: audit.ActionLoginSuccess, Resource: "session",
+			Result: audit.ResultSuccess, Timestamp: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, next, err := s.ListAudit(ctx(), 3, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	if next == "" {
+		t.Fatal("expected a next cursor")
+	}
+}
+
+func TestPingAndClose(t *testing.T) {
+	s := memorystore.New()
+	if err := s.Ping(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListUsersIsStableAndIsolated(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	for _, u := range []auth.User{
+		{ID: "usr_b", Username: "bob", PasswordHash: "x", Role: authorization.RoleAnalyst, CreatedAt: now},
+		{ID: "usr_a", Username: "admin", PasswordHash: "x", Role: authorization.RoleAdmin, CreatedAt: now},
+	} {
+		u := u
+		if err := s.SaveUser(ctx(), &u); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	users, err := s.ListUsers(ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 2 || users[0].Username != "admin" || users[1].Username != "bob" {
+		t.Fatalf("users not ordered by username: %+v", users)
+	}
+
+	// Mutating a returned record must not change stored state.
+	users[0].Disabled = true
+	fresh, err := s.GetUser(ctx(), "usr_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Disabled {
+		t.Fatal("stored user was mutated through a listed copy")
+	}
+}
+
+func TestIncidentSourceIPsRoundTrip(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	inc := &incidents.Incident{
+		ID: "inc_1", Title: "t", Summary: "s",
+		Severity: model.SeverityHigh, Status: incidents.StatusNew,
+		Hosts: []string{"web-01"}, Actors: []string{"root"}, SourceIPs: []string{"203.0.113.7"},
+		AlertIDs: []string{"alt_1"}, EventIDs: []string{"evt_1"},
+		FirstSeen: now, LastSeen: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.SaveIncident(ctx(), inc); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetIncident(ctx(), "inc_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SourceIPs) != 1 || got.SourceIPs[0] != "203.0.113.7" {
+		t.Fatalf("source_ips did not round-trip: %v", got.SourceIPs)
+	}
+}

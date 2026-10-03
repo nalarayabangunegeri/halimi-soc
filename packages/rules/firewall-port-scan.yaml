@@ -1,0 +1,18 @@
+id: firewall-port-scan
+version: 1
+name: Firewall Port Scan
+description: Unusual burst of firewall-blocked packets from one source address
+severity: medium
+
+match:
+  types:
+    - network.firewall.block
+
+threshold:
+  count: 10
+  window: 5m
+
+group_by:
+  - network.src_ip
+
+cooldown: 15m

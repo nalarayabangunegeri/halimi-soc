@@ -1,0 +1,23 @@
+id: sudo-after-suspicious-login
+version: 1
+name: Privilege Escalation After Suspicious Login
+description: A privileged sudo command executed by an account that just logged in suspiciously
+severity: high
+
+match:
+  types:
+    - auth.sudo.command
+
+threshold:
+  count: 1
+  window: 15m
+
+group_by:
+  - actor
+
+requires:
+  rule_id: ssh-login-after-bruteforce
+  window: 15m
+  match_on: actor
+
+cooldown: 5m

@@ -1,0 +1,20 @@
+id: http-auth-failure-spike
+version: 1
+name: HTTP Authentication Failure Spike
+description: Unusual burst of HTTP 401/403 responses from one source address
+severity: medium
+
+match:
+  types:
+    - http.auth.failed
+  outcomes:
+    - failure
+
+threshold:
+  count: 10
+  window: 60s
+
+group_by:
+  - network.src_ip
+
+cooldown: 5m

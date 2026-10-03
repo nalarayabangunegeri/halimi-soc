@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Config / secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Agent runtime state
+/data/
+/spool/
+
+# Coverage
+coverage.txt
+coverage.html
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

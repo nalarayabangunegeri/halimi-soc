@@ -1,0 +1,20 @@
+id: sudo-auth-failure-burst
+version: 1
+name: Sudo Authentication Failure Burst
+description: Repeated failed sudo authentication for one account, indicating credential guessing
+severity: high
+
+match:
+  types:
+    - auth.sudo.auth_failed
+  outcomes:
+    - failure
+
+threshold:
+  count: 3
+  window: 60s
+
+group_by:
+  - actor
+
+cooldown: 5m

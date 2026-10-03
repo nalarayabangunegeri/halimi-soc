@@ -1,0 +1,23 @@
+id: ssh-authorized-keys-modified
+version: 1
+name: SSH Authorized Keys Modified
+description: An account's SSH authorized_keys changed after suspicious authentication activity
+severity: critical
+
+match:
+  types:
+    - security.authorized_keys.modified
+
+threshold:
+  count: 1
+  window: 30m
+
+group_by:
+  - actor
+
+requires:
+  rule_id: ssh-login-after-bruteforce
+  window: 30m
+  match_on: actor
+
+cooldown: 5m

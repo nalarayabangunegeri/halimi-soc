@@ -1,0 +1,23 @@
+id: root-privileged-command-from-untrusted-source
+version: 1
+name: Privileged Command After Remote Login
+description: A root-level sudo command executed on a host that recently accepted a remote SSH login
+severity: medium
+
+match:
+  types:
+    - auth.sudo.command
+
+threshold:
+  count: 1
+  window: 30m
+
+group_by:
+  - host
+
+requires:
+  rule_id: ssh-bruteforce
+  window: 30m
+  match_on: host
+
+cooldown: 10m

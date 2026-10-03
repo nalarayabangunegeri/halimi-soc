@@ -1,0 +1,27 @@
+id: ssh-login-after-bruteforce
+version: 1
+name: Successful SSH Login After Brute Force
+description: A successful SSH authentication from a source that just failed repeatedly
+severity: critical
+
+match:
+  types:
+    - auth.ssh.login_success
+  outcomes:
+    - success
+
+threshold:
+  count: 1
+  window: 10m
+
+group_by:
+  - network.src_ip
+
+# Chaining is what makes this deterministic rather than a naive
+# "any successful login is critical" rule.
+requires:
+  rule_id: ssh-bruteforce
+  window: 10m
+  match_on: network.src_ip
+
+cooldown: 5m
