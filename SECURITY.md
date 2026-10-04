@@ -28,6 +28,17 @@ These are implemented and covered by tests. Nothing else is claimed.
 | Alert severity comes from the rule, never from the event or the client | `internal/detection/engine` |
 | Rules cannot execute code and are rejected wholesale if invalid | `internal/detection/rules` |
 | Passwords are Argon2id-hashed; sessions are server-side and revocable | `internal/auth` |
+| Passwords are bounded 12–128 chars; overlong is rejected before hashing | `internal/auth/password.go`, `internal/api/handlers_auth.go` |
+| TOTP MFA (6-digit/30s/±1 skew) with sealed secrets and single-use backup codes | `internal/mfa`, `internal/api/handlers_mfa.go`, migration `0004_mfa.sql` |
+| Passkeys (WebAuthn, ES256, none/packed, UV required, origin-bound, clone detection) | `internal/webauthn`, `internal/api/handlers_webauthn.go`, migration `0005_passkeys.sql` |
+| TOTP setup shows a local QR (no network) plus manual secret | `apps/web/src/components/MfaSettings.tsx` (`react-qr-code`) |
+| Sessions expire on absolute TTL and on 2h idle; activity refreshes `last_seen_at` | `internal/api/server.go`, `internal/config` |
+| Self password change needs the current password; admin reset is admin-only and both revoke sessions | `internal/api/handlers_users.go` |
+| Enrollment is rate-limited per IP/global | `internal/api/handlers_agents.go` |
+| Analyze requires CSRF and is throttled per user/global; concurrent LLM calls are bounded | `internal/api/handlers_analyze.go`, `internal/ai` |
+| Webhooks sign with HMAC-SHA256 when configured and never target metadata | `internal/notify` |
+| AI provider refuses cleartext remote and metadata URLs | `internal/ai/provider.go` |
+| `/metrics` accepts a bearer token when configured | `internal/api/handlers_health.go` |
 | Agent tokens are stored only as hashes | `internal/auth`, `internal/storage/postgres` |
 | State-changing requests require a CSRF token | `internal/api` |
 | Authorization is enforced server-side per permission | `internal/authorization` |

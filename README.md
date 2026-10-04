@@ -41,9 +41,11 @@ implemented.
 - Deterministic detection: threshold, sliding window, grouping, cooldown and
   rule chaining, with rules as validated YAML data
 - Entity-aware correlation into incidents with an ordered kill-chain narrative
-- Authenticated API: sessions with CSRF, agent bearer tokens, RBAC with admin
-  user management, transactional rule reload, audit log, cursor pagination,
-  Prometheus metrics
+- Authenticated API: sessions with CSRF (absolute TTL plus inactivity timeout),
+  agent bearer tokens, RBAC with admin user management, opt-in TOTP second
+  factor and passkeys (WebAuthn, including passwordless login), password change
+  with session revocation, transactional rule reload, audit log, cursor
+  pagination, Prometheus metrics (optional bearer token)
 - Eight detection rules covering brute force, suspicious login, privilege
   escalation, persistence, HTTP authentication spikes and firewall port scans
 - Safe attack simulation mode that exercises the real parser path
@@ -67,7 +69,10 @@ See [Verification](#verification).
 
 **Not built yet:**
 
-- Additional parsers: Docker, generic syslog.
+- Additional parsers: generic syslog (cron, systemd, non-UFW firewall drivers).
+  The Docker json-file envelope parser above is built; generic syslog stays out
+  deliberately — an event per syslog line would turn system chatter into stored
+  telemetry.
 - Response actions — post-MVP, admin-approved only
 
 ## Architecture
@@ -282,7 +287,8 @@ Hardening and configuration: [`docs/security/configuration.md`](docs/security/co
 
 Highlights:
 
-- Passwords hashed with Argon2id; sessions stored server-side and revocable
+- Passwords hashed with Argon2id (12–128 chars); sessions stored server-side and revocable
+- Opt-in TOTP second factor and passkeys (WebAuthn), including passwordless login
 - Agent tokens stored only as SHA-256 hashes, rotating invalidates the previous
 - CSRF required on every cookie-authenticated state change
 - Authorization enforced server-side per permission, never by hiding UI

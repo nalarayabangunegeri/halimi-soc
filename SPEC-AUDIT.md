@@ -1969,6 +1969,9 @@ Resolved since this section was written:
 | Console asset and audit views | Shipped: `apps/web` `/assets` and `/audit` pages, overview volume chart and detection-health card. |
 | Incident notifications | Shipped: `internal/notify` webhook on creation only, scope-only payload, bounded async delivery with metrics. |
 | Rule authoring UI | Shipped: console `/rules/new` and edit pages plus validate/save/delete/reload API; saves are atomic, activation stays an explicit reload, last-rule delete refused. |
+| Operator TOTP second factor | Shipped (PRD amendments A10, ADR-014): `internal/mfa` (stdlib-only TOTP, sealed secrets, single-use backup codes), migration `0004_mfa.sql`, `POST /api/v1/auth/mfa/{setup,enable,disable,status}` plus admin reset, login accepts `totp_code`/`backup_code` with per-user/per-IP throttling and `MFA_REQUIRED` for a missing code. |
+| Operator passkeys (WebAuthn) | Shipped (PRD amendment A11, ADR-015): stdlib-only verifier in `internal/webauthn` (ES256, `none`/`packed` self-attestation, user verification required, origin-bound, clone detection), migration `0005_passkeys.sql`, passwordless login minting normal sessions, console `/settings` with local QR for TOTP setup. |
+| Authentication hardening batch | Shipped: password 12–128 bounds with pre-hash rejection, session inactivity timeout plus absolute TTL, password change with session revocation, bootstrap recovery when no active admin remains, enrollment rate limiting, CSRF on AI analysis, `/metrics` bearer-token option, webhook HMAC signing with metadata-URL refusal, AI provider cleartext/metadata refusal, AI concurrency bound with per-user analyze quota, old-timestamp marking with `clock_skew_anomaly_total`, cooldown-suppression counting. |
 
 Completed since this section was written, each with the tests `AGENTS.md` §8
 requires: the web dashboard (PRD §16 Milestone 5 — `apps/web`, 17 end-to-end

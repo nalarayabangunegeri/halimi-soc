@@ -21,6 +21,8 @@ while being wrong.
 | No rule files found | exit |
 | A rule file fails validation | exit |
 | Migration files missing | exit |
+| `HALIMISOC_AI_BASE_URL` targeting cloud metadata or cleartext remote (non-loopback http) | exit at provider construction |
+| `HALIMISOC_WEBHOOK_URL` targeting cloud metadata or embedding credentials | exit |
 
 ## Resource limits
 
@@ -52,7 +54,34 @@ justifies it.
 
 The console is a server-side session holder: the browser only ever receives an
 HttpOnly cookie it cannot read, and every mutation passes through a closed
-allowlist on the server before it reaches the API.
+allowlist on the server before it reaches the API. The web session codec
+rejects anything outside the token alphabet (`sess_` + base64url, base64url
+CSRF, lowercase usernames), so a tampered cookie cannot become header injection
+into the server-to-API `Cookie` header.
+
+## Operator MFA (TOTP)
+
+| Setting | Behaviour |
+|---|---|
+| `HALIMISOC_MFA_KEY` unset | TOTP secrets store as `plain:<base32>`; production warns at startup |
+| `HALIMISOC_MFA_KEY` set (base64 32B) | secrets sealed AES-256-GCM `v1:nonce:ct` |
+| `POST /auth/mfa/setup` | authenticated + CSRF; rotates pending secret, returns secret + `otpauth_url` |
+| `POST /auth/mfa/enable` | verifies code (±1 step), enables, returns 10 backup codes once (hashes only stored) |
+| Login | `{username,password,totp_code\|backup_code}`; missing code -> 401 `MFA_REQUIRED`; backup codes single-use |
+| `POST /auth/mfa/disable` | needs password + code; clears secret and backups |
+| `POST /users/{id}/mfa/reset` | admin + CSRF lost-authenticator recovery; audited |
+| Guessing | per-user/per-IP backoff with 429, audited `MFA_LOGIN_FAILURE`, counted `mfa_failure_total` |
+
+## Passkeys (WebAuthn)
+
+| Setting | Behaviour |
+|---|---|
+| `HALIMISOC_WEBAUTHN_RP_ID` (default `127.0.0.1`) | effective console domain, no port; must be a hostname, never an IP literal — browsers reject IPs as invalid RP IDs |
+| `HALIMISOC_WEBAUTHN_ORIGINS` (default both loopback `:3000` origins) | exact allowlist checked against `clientData.origin` on every ceremony |
+| Production with `http://` non-loopback origin | fail closed at startup |
+| Algorithms / formats | ES256 only; attestation `none` + `packed` self; anything else rejected |
+| Challenges | 32B random, single-use, 5-minute TTL, bounded in-memory store |
+| Login | passwordless; success mints a normal session and rotates the sign count; backwards counters rejected as suspected clones |
 
 | Setting | Behaviour |
 |---|---|
@@ -85,7 +114,11 @@ rather than protect it.
 |---|---|
 | `HALIMISOC_AI_BASE_URL` and `HALIMISOC_AI_API_KEY` unset | AI disabled; analysis returns the computed summary |
 | `HALIMISOC_AI_MODEL` | model name sent to the OpenAI-compatible provider |
+| `HALIMISOC_AI_BASE_URL` with `http://` to a non-loopback host | fail closed at startup (the API key would be sniffable) |
+| `HALIMISOC_AI_BASE_URL` targeting cloud metadata | fail closed at startup |
 | Half-configured provider | fail closed at startup |
+| Concurrent provider calls | bounded (default 2); excess degrades to `UNAVAILABLE` instead of queueing |
+| `POST /incidents/{id}/analyze` | requires session + `run_ai_analysis` + CSRF; throttled 10 then backoff per user/global with 429 |
 
 Provider credentials stay server-side and are never logged. Detection,
 correlation, severity and authorization never depend on the provider.
@@ -100,7 +133,8 @@ into an alert storm at the receiver.
 |---|---|
 | `HALIMISOC_WEBHOOK_URL` unset | delivery disabled |
 | `HALIMISOC_WEBHOOK_URL` set | `POST` JSON to that URL with a 5s default timeout (`HALIMISOC_WEBHOOK_TIMEOUT`) |
-| Invalid URL (non-http(s) scheme, embedded credentials) | fail closed at startup |
+| `HALIMISOC_WEBHOOK_SECRET` set (≥16 chars) | body signed as `X-HalimiSOC-Signature: sha256=<hex HMAC>`; receivers must verify |
+| Invalid URL (non-http(s) scheme, embedded credentials, cloud metadata host) | fail closed at startup |
 
 Delivery guarantees, stated plainly:
 
@@ -118,17 +152,23 @@ Delivery guarantees, stated plainly:
 
 1. Set `HALIMISOC_ENV=production`.
 2. Set `HALIMISOC_SECURE_COOKIES=true` and serve the API over HTTPS only.
-3. Set a unique `HALIMISOC_ADMIN_PASSWORD` of at least 12 characters, then
+3. Set a unique `HALIMISOC_ADMIN_PASSWORD` of 12–128 characters, then
    remove it from the environment once the account exists.
-4. Set a random `HALIMISOC_AGENT_ENROLL_SECRET` of at least 24 characters.
-5. Bind `HALIMISOC_LISTEN_ADDR` to loopback and terminate TLS in a reverse proxy.
-6. Bind PostgreSQL to loopback and give the application a least-privilege role.
-7. Confirm `/api/v1/readiness` reports `ok` and a non-zero `rules_loaded`.
-8. Confirm `/metrics` is reachable only from the monitoring network. The endpoint
-   is unauthenticated and exposes counters, so restrict it at the proxy.
-9. If the console is deployed, serve it over HTTPS and leave
-   `HALIMISOC_WEB_ALLOW_INSECURE_COOKIES` unset. Set `HALIMISOC_API_URL` to a
-   loopback address so the API is never reachable from the browser.
+4. Generate `HALIMISOC_MFA_KEY` (`openssl rand -base64 32`) so TOTP secrets are
+   AES-256-GCM sealed; without it secrets store as `plain:`.
+5. Enroll MFA on every operator (`Settings` -> setup -> verify) and store the
+   10 backup codes offline. Use admin `mfa/reset` for lost authenticators.
+   Consider registering a passkey per operator as the phishing-resistant factor.
+6. Set a random `HALIMISOC_AGENT_ENROLL_SECRET` of at least 24 characters.
+7. Set `HALIMISOC_SESSION_IDLE` (default 2h, must not exceed `HALIMISOC_SESSION_TTL`).
+8. Set `HALIMISOC_METRICS_TOKEN` or restrict `/metrics` to the monitoring network. The endpoint exposes counters even when open, so never publish it.
+9. Set `HALIMISOC_WEBHOOK_SECRET` (≥16 chars) when webhooks are enabled and verify `X-HalimiSOC-Signature` on the receiver.
+10. Bind `HALIMISOC_LISTEN_ADDR` to loopback and terminate TLS in a reverse proxy.
+11. Bind PostgreSQL to loopback and give the application a least-privilege role.
+12. Confirm `/api/v1/readiness` reports `ok` and a non-zero `rules_loaded`.
+13. If the console is deployed, serve it over HTTPS and leave
+    `HALIMISOC_WEB_ALLOW_INSECURE_COOKIES` unset. Set `HALIMISOC_API_URL` to a
+    loopback address so the API is never reachable from the browser.
 
 ## Reverse proxy
 

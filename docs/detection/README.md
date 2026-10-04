@@ -115,6 +115,27 @@ sequence straddling a restart may not alert. This is a documented MVP limitation
 counted, because counting it would attribute activity to a key that does not
 identify anyone.
 
+## Known detection gaps
+
+Stated here so nobody mistakes them for bugs. Each is a deliberate
+determinism-over-recall trade-off with a test that locks it in.
+
+- **Low-and-slow evasion.** A spray that stays under threshold (4 failures per
+  60s against a count-5 rule) never alerts, and a stolen credential used
+  without a preceding brute force never satisfies a chained rule. Catching
+  those would mean alerting on single logins, which is noise, not detection.
+  (`TestLowAndSlowSprayDoesNotAlert`, `TestChainingRequiresPrerequisite`)
+- **Infrastructure rotation splits incidents.** An attacker who brute-forces
+  one host from one address and logs into another host from another address
+  shares no concrete entity with the first incident, so correlation honestly
+  opens a second one. Merging on time proximity alone would manufacture attack
+  chains out of coincidence. (`TestRotatedInfrastructureStartsNewIncident`,
+  `TestWeakEntityAloneDoesNotMergeDifferentHosts`)
+- **Cooldown hides the second burst as an alert, not as evidence.** A burst
+  inside an active cooldown is counted in
+  `detection_cooldown_suppressed_total` and still correlates, but emits no new
+  alert. (`TestCooldownSuppressionIsCounted`)
+
 ## Testing a rule
 
 Every production rule must have: a positive case, a negative case, a threshold

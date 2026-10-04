@@ -588,6 +588,11 @@ Argon2id, m=64 MiB, t=3, p=4, encoded as a PHC string. The parameters are encode
 in the hash so they can be raised later without invalidating existing credentials;
 `NeedsRehash` upgrades a credential opportunistically on the next successful login.
 
+Passwords are bounded to 12–128 characters. The maximum exists because each
+unauthenticated login attempt costs a full Argon2id verification: without a
+bound, an 8 KiB password turns the login endpoint into a cheap CPU/RAM denial
+of service. Overlong values are rejected before any hashing work happens.
+
 Sessions are **server-side** (ADR-009). A stateless signed cookie cannot be
 revoked before it expires, which is unacceptable for an administrative console.
 
@@ -598,6 +603,18 @@ revoked before it expires, which is unacceptable for an administrative console.
   by the presented cookie without storing or indexing the plaintext token.
 - CSRF: a synchroniser token delivered in the login response and echoed in
   `X-CSRF-Token`. A custom header cannot be set by a cross-origin form post.
+- Lifetime is two bounds, not one: an absolute TTL (default 12h,
+  `HALIMISOC_SESSION_TTL`) and an inactivity timeout (default 2h,
+  `HALIMISOC_SESSION_IDLE`, never above the TTL). Activity refreshes
+  `last_seen_at` best-effort. A stolen cookie is therefore useful for at most
+  the idle window, even when the absolute TTL is long.
+- A password change revokes every session for the account, including the
+  caller's: the caller logs in again. Keeping old sessions alive across a
+  password change would defeat the change.
+- If no active administrator remains (all disabled or none exists), bootstrap
+  from `HALIMISOC_ADMIN_PASSWORD` creates a recovery admin instead of leaving
+  the deployment permanently locked out. It still requires the
+  operator-controlled secret and is audited.
 
 Login is rate limited on **two independent keys** — per account and per source
 address — so distributed guessing against one account and one host spraying many
@@ -624,6 +641,10 @@ does not survive rotation. Revocation revokes the agent and all its tokens.
 An agent token grants access only to ingestion, heartbeat and self-inspection. It
 is never an operator credential.
 
+Enrollment (`POST /api/v1/agents/register`) is rate limited per source address
+and globally for the same reason login is: the shared enrollment secret is
+otherwise an online brute-force oracle.
+
 ### 9.3 Authorization
 
 Package: `internal/authorization`. Enforced server-side, per permission, never by
@@ -647,6 +668,48 @@ granting it, so a missing entry cannot silently become a privilege escalation.
 - `POST /api/v1/agents/{id}/heartbeat` checks the path id against the credential.
   The credential is the authority; the path value is an untrusted claim that must
   agree with it.
+
+### 9.5 TOTP second factor (ADR-014)
+
+Opt-in per account. TOTP is RFC 6238/4226: 6 digits, 30s step, SHA1, ±1 step
+skew, 20-byte secret, constant-time verification — standard library only, no
+new Go dependency.
+
+- The secret is sealed at rest: AES-256-GCM under `HALIMISOC_MFA_KEY`
+  (`v1:nonce:ciphertext`); without a key it stores as `plain:` (dev only, with
+  a production startup warning). A database-only leak without the env key is
+  then insufficient to forge codes.
+- Enrollment is setup → enable (verify a code) → 10 single-use backup codes
+  returned once; only SHA-256 hashes are stored and a used code is consumed.
+  Disabling needs the password plus a current code; an admin can reset a lost
+  authenticator (`POST /api/v1/users/{id}/mfa/reset`).
+- Login stays one request: `{username, password, totp_code | backup_code}`.
+  A correct password with a missing code returns 401 `MFA_REQUIRED` so the UI
+  can prompt; a wrong code returns indistinguishable `invalid credentials`.
+  Second-factor attempts are throttled per user and per source address.
+- TOTP kills password replay but stays relayable inside its validity window,
+  which is why passkeys exist alongside it (§9.6).
+
+### 9.6 Passkeys / WebAuthn (ADR-015)
+
+Phishing-resistant sign-in: the credential is bound to the origin, so a fake
+console on another origin cannot use it. Minimal stdlib-only verifier, no new
+Go dependency.
+
+- COSE ES256 (P-256) only; attestation `none` plus `packed` self-attestation;
+  CA attestation (`x5c`), TPM/Android/Apple formats, RSA/OKP keys and
+  `UV=false` are rejected with explicit errors.
+- RP ID plus an exact origin allowlist (`HALIMISOC_WEBAUTHN_RP_ID`,
+  `HALIMISOC_WEBAUTHN_ORIGINS`) are checked on every ceremony; production
+  refuses cleartext non-loopback origins at startup.
+- Challenges are 32 random bytes, single-use, 5-minute TTL, held in a bounded
+  in-memory store (single-node MVP, same rationale as the login limiter).
+- Registration is authenticated + CSRF (max 10 keys per account); passwordless
+  login (`begin` → platform dialog → `complete`) mints a normal server-side
+  session, so TTL, idle, CSRF, revocation and RBAC all apply unchanged. A
+  passkey login counts as its own MFA (possession + user verification).
+- Clone detection: a presented sign-count at or below the stored count (both
+  non-zero) is rejected and audited as a suspected clone.
 
 ---
 

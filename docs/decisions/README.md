@@ -23,6 +23,8 @@ deliberate trade-off and an accident.
 | [011](ADR-011-retention-and-raw-evidence.md) | Raw evidence expires before structured events |
 | [012](ADR-012-canonical-event-shape.md) | Flat canonical event shape |
 | [013](ADR-013-incident-lifecycle-superset.md) | Incident lifecycle is a superset of the PRD minimum |
+| [014](ADR-014-totp-mfa.md) | TOTP second factor for operators |
+| [015](ADR-015-passkey-webauthn.md) | Passkeys (WebAuthn) for phishing-resistant sign-in |
 
 ## Adding a decision
 

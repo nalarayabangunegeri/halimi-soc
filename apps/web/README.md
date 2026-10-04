@@ -14,6 +14,16 @@ authorization enforcement point.
 See `DESIGN.md` §10.6 for the design and `docs/security/configuration.md` for the
 console's configuration and CSP.
 
+## Dependencies
+
+Production dependencies are deliberately `next`, `react`, `react-dom`,
+`server-only`, plus one: `react-qr-code` renders the TOTP `otpauth://` URL as
+inline SVG during MFA setup. Justification per `AGENTS.md` §12: the browser has
+no stdlib QR renderer; a server-rendered PNG would need a new Go dependency
+plus caching for a secret that must be shown once; the component takes only
+our own otpauth URL (never raw telemetry), makes no network calls, and
+`npm audit --omit=dev` reports 0 vulnerabilities with it installed.
+
 ## Commands
 
 Run these from `apps/web`:

@@ -43,7 +43,7 @@ Stack traces, SQL, filesystem paths and credentials are never returned.
 |---|---|---|---|
 | GET | `/api/v1/health` | none | Liveness. Does not touch the database. |
 | GET | `/api/v1/readiness` | none | Readiness. Checks the database and reports loaded rules. |
-| GET | `/metrics` | none | Prometheus text format. Restrict at the proxy. |
+| GET | `/metrics` | bearer token when `HALIMISOC_METRICS_TOKEN` is set, else none | Prometheus text format. Counters only. Set the token in production or restrict at the proxy. |
 
 `/healthz` and `/readyz` are kept as aliases for orchestrators that are
 conventionally configured with those names.
@@ -52,15 +52,36 @@ conventionally configured with those names.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/api/v1/auth/login` | none | Returns the user, a CSRF token and the session expiry. |
+| POST | `/api/v1/auth/login` | none | Returns the user, a CSRF token and the session expiry. Passwords 12–128 chars; overlong is rejected before hashing. Login and enrollment are rate-limited per account/IP with `Retry-After` on 429. Body accepts optional `totp_code` / `backup_code`; missing second factor returns 401 `MFA_REQUIRED`. |
 | POST | `/api/v1/auth/logout` | session + CSRF | Revokes the session server-side. |
 | GET | `/api/v1/auth/session` | session | Returns the current user and CSRF token. |
+| POST | `/api/v1/auth/password` | session + CSRF | Self password change `{"current_password","new_password"}`; revokes all sessions including the caller. |
+| GET | `/api/v1/auth/mfa/status` | session | `{"enabled","enrolled_at"}`. |
+| POST | `/api/v1/auth/mfa/setup` | session + CSRF | Generates a sealed TOTP secret, returns `{"secret","otpauth_url"}`. Rotates pending secret. |
+| POST | `/api/v1/auth/mfa/enable` | session + CSRF | Body `{"code"}`; enables MFA and returns 10 single-use `backup_codes` (once). |
+| POST | `/api/v1/auth/mfa/disable` | session + CSRF | Body `{"password","code"}`; clears secret and backups. |
+
+### Passkeys (WebAuthn)
+
+Phishing-resistant sign-in. Registration is authenticated; login is
+passwordless and mints a normal session. Only ES256 keys, `none`/`packed`
+self-attestation, user verification required. Challenges are single-use,
+5-minute TTL.
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/api/v1/auth/webauthn/register/begin` | session + CSRF | Returns challenge + `rp` + `excludeCredentials`. Optional `{"name"}`. |
+| POST | `/api/v1/auth/webauthn/register/complete` | session + CSRF | Body `{"challenge","id","name","transports","response":{"clientDataJSON","attestationObject"}}`; max 10 keys. |
+| GET | `/api/v1/auth/webauthn/credentials` | session | Lists own keys (no public material). |
+| DELETE | `/api/v1/auth/webauthn/credentials/{id}` | session + CSRF | Deletes own key; warns when removing the last second factor. |
+| POST | `/api/v1/auth/webauthn/login/begin` | none (throttled) | Body `{"username"}`; unknown users get a generic 400. |
+| POST | `/api/v1/auth/webauthn/login/complete` | none (throttled) | Verifies assertion + clone detection, mints a session. |
 
 ### Agents
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/api/v1/agents/register` | enrollment secret | Returns the agent token once. |
+| POST | `/api/v1/agents/register` | enrollment secret | Returns the agent token once. Rate-limited per IP/global; brute-force returns 429. |
 | GET | `/api/v1/agents/me` | agent | Returns the calling agent's own record. |
 | POST | `/api/v1/agents/{id}/heartbeat` | agent | Body optional. The id must match the credential. |
 | GET | `/api/v1/agents` | `view_agents` | |
@@ -95,7 +116,7 @@ must not stop the rest of a log stream from being ingested.
 | GET | `/api/v1/incidents` | `view_incidents` | |
 | GET | `/api/v1/incidents/{id}` | `view_incidents` | Includes stages, alerts and evidence ids. |
 | PATCH | `/api/v1/incidents/{id}/status` | `change_incident_status` + CSRF | `NEW`, `ACKNOWLEDGED`, `INVESTIGATING`, `CONTAINED`, `RESOLVED`, `CLOSED`, `FALSE_POSITIVE`. |
-| POST | `/api/v1/incidents/{id}/analyze` | `run_ai_analysis` | Advisory analysis. Returns the computed summary when no provider is configured. |
+| POST | `/api/v1/incidents/{id}/analyze` | `run_ai_analysis` + CSRF | Advisory analysis. Returns the computed summary when no provider is configured. Throttled per user/global (10 then backoff, 429); concurrent provider calls are bounded and degrade to `UNAVAILABLE`. |
 
 ### Inventory and overview
 
@@ -112,8 +133,10 @@ must not stop the rest of a log stream from being ingested.
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | GET | `/api/v1/users` | `manage_users` | Every operator account; password hashes are never serialised. |
-| POST | `/api/v1/users` | `manage_users` + CSRF | Body `{"username","password","role"}`; password minimum 12 characters. |
+| POST | `/api/v1/users` | `manage_users` + CSRF | Body `{"username","password","role"}`; password 12–128 characters. |
 | PATCH | `/api/v1/users/{id}/status` | `manage_users` + CSRF | Body `{"disabled":true}`; revokes the account's sessions. Self-disable and disabling the last active admin return `409`. |
+| PATCH | `/api/v1/users/{id}/password` | `manage_users` + CSRF | Admin reset `{"new_password"}` for another account; revokes the target's sessions. Cannot target self (use `/auth/password`). |
+| POST | `/api/v1/users/{id}/mfa/reset` | `manage_users` + CSRF | Clears a lost authenticator (secret + backups); target re-enrolls. |
 
 ### Rule authoring
 

@@ -1,6 +1,6 @@
 # HalimiSOC — Product Requirements Document
 
-**Version:** 0.4.0  
+**Version:** 0.5.0  
 **Status:** Implemented (backend); see `DESIGN.md` for the as-built technical contract  
 **Project:** HalimiSOC  
 **Tagline:** Lightweight, AI-Assisted Security Operations Center  
@@ -27,6 +27,8 @@ not lower any requirement; each change is recorded here and explained in
 | A7 | Agent heartbeat is addressed as `POST /api/v1/agents/{id}/heartbeat`, and the id must match the presented credential. | An id-free heartbeat cannot be authorized against a credential, so one agent could report liveness for another. |
 | A8 | Alert and incident status changes use `PATCH`, not `POST`. | A status change is a partial update of an existing resource. `POST` implied creating a sub-resource. |
 | A9 | FR-06 Rule E (HTTP authentication failure spike) is shipped, fed by a new nginx access-log parser. | The deferral in A4 is lifted: `http.access` is now a supported source class, `http.auth.failed` a canonical event type, and the rule fires on 10 HTTP 401/403 responses from one source within 60s. Only failures become events; successful requests are non-security-relevant. |
+| A10 | Operator TOTP multi-factor authentication is shipped (amendment to §7.1 and FR-01). | Password-only console access was the highest-value residual finding from the penetration review: a stolen password meant full takeover. TOTP (6-digit/30s, sealed secrets, single-use backup codes, throttled verification, admin recovery) is opt-in per account. Recorded in ADR-014. |
+| A11 | Operator passkeys (WebAuthn) are shipped as a phishing-resistant sign-in. | TOTP codes stay relayable within their validity window. Passkeys bind the credential to the origin (ES256 only, `none`/`packed` self-attestation, user verification required, clone detection). Passwordless login mints a normal server-side session. Recorded in ADR-015. |
 
 An amendment that removes a requirement would be raised as a contradiction instead.
 None of the above does.
@@ -214,7 +216,7 @@ ANALYST
 READONLY
 ```
 
-Future authorization enhancements may include fine-grained permissions, enterprise identity, OIDC/SSO, and MFA.
+Future authorization enhancements may include fine-grained permissions and enterprise identity / OIDC/SSO. Operator MFA (TOTP and passkeys) shipped as amendments A10–A11.
 
 ### 7.2 Response Automation
 
@@ -298,13 +300,15 @@ The dashboard and all protected operational APIs **MUST** require authenticated 
 
 The MVP **MUST** provide:
 
-- password-based authentication;
+- password-based authentication (12–128 characters; overlong rejected before hashing);
 - Argon2id or equivalent password hashing;
-- login rate limiting;
+- opt-in TOTP multi-factor authentication with sealed secrets and single-use backup codes (amendment A10);
+- opt-in passkeys (WebAuthn) as phishing-resistant sign-in, including passwordless login (amendment A11);
+- login rate limiting (password and second-factor attempts throttled independently);
 - failed-login backoff;
 - secure session cookies;
-- session expiration;
-- session revocation;
+- session expiration (absolute TTL plus inactivity timeout);
+- session revocation (including on password change and account disable);
 - CSRF protection for cookie-authenticated state changes;
 - server-side authorization;
 - audit logging for security-sensitive auth actions;
@@ -1948,7 +1952,6 @@ Do not claim external-provider privacy properties that are not actually provided
 - advanced anomaly detection;
 - fine-grained/enterprise authorization;
 - OIDC/SSO;
-- MFA;
 - multi-tenant architecture;
 - advanced endpoint telemetry;
 - graph-based investigation;
