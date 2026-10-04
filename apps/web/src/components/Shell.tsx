@@ -35,6 +35,7 @@ const NAV = [
   { href: '/agents', label: 'Agents', key: 'agents', count: 'agents' as const },
   { href: '/rules', label: 'Rules', key: 'rules', count: undefined },
   { href: '/audit', label: 'Audit', key: 'audit', count: undefined },
+  { href: '/settings', label: 'Settings', key: 'settings', count: undefined },
 ]
 
 export function Shell({ title, subtitle, username, role, counts, headerExtras, children, active }: ShellProps) {

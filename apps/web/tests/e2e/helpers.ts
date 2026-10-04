@@ -1,4 +1,5 @@
 import { expect, type Page, type APIRequestContext } from '@playwright/test'
+import { createHmac } from 'node:crypto'
 
 // Shared helpers for the dashboard suite.
 
@@ -15,7 +16,31 @@ export async function signIn(page: Page, username = ADMIN.username, password = A
   await page.goto('/login')
   await page.getByLabel('Username').fill(username)
   await page.getByLabel('Password').fill(password)
-  await page.getByRole('button', { name: 'Sign in' }).click()
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+}
+
+/**
+ * Signs in as an MFA-enrolled operator through the dashboard's two-step form.
+ *
+ * `getCode` is called after the password step returns MFA_REQUIRED; it receives
+ * the TOTP secret captured during enrollment and must return the current code.
+ */
+export async function signInWithMFA(
+  page: Page,
+  username: string,
+  password: string,
+  getCode: () => string,
+): Promise<void> {
+  await page.goto('/login')
+  await page.getByLabel('Username').fill(username)
+  await page.getByLabel('Password').fill(password)
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+  // The form reveals the second-factor field only when the API answers
+  // MFA_REQUIRED: asserting it here proves the prompt is not shown upfront.
+  await expect(page.getByLabel('Authenticator code or backup code')).toBeVisible()
+  await page.getByLabel('Authenticator code or backup code').fill(getCode())
+  await page.getByRole('button', { name: 'Verify and sign in' }).click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
 }
 
@@ -103,7 +128,6 @@ export async function ingest(
 }
 
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
-
 /**
  * Generates a ULID-shaped identifier that matches the server's format.
  *
@@ -125,4 +149,39 @@ function newEventID(): string {
     encoded = CROCKFORD[Number((value >> BigInt(i * 5)) & 31n)] + encoded
   }
   return `evt_${encoded}`
+}
+
+/**
+ * Computes a TOTP code for a base32 (no-padding) secret.
+ *
+ * Test-only twin of `internal/mfa`: 6 digits, 30s step, SHA1. Kept here rather
+ * than imported so the black-box suite never shares code with the system under
+ * test — agreement between two independent implementations is the assertion.
+ */
+export function totpCode(secret: string, at = Date.now()): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  const clean = secret.replace(/=+$/, '').toUpperCase()
+  const bits: number[] = []
+  for (const ch of clean) {
+    const v = alphabet.indexOf(ch)
+    if (v < 0) throw new Error(`bad base32 character ${ch}`)
+    for (let i = 4; i >= 0; i--) bits.push((v >> i) & 1)
+  }
+  const bytes = new Uint8Array(bits.length >> 3)
+  for (let i = 0; i < bytes.length; i++) {
+    let b = 0
+    for (let j = 0; j < 8; j++) b = (b << 1) | (bits[i * 8 + j] ?? 0)
+    bytes[i] = b
+  }
+  const counter = Math.floor(at / 1000 / 30)
+  const msg = Buffer.alloc(8)
+  msg.writeBigUInt64BE(BigInt(counter))
+  const mac = createHmac('sha1', Buffer.from(bytes)).update(msg).digest()
+  const offset = (mac[mac.length - 1] ?? 0) & 0x0f
+  const bin =
+    (((mac[offset] ?? 0) & 0x7f) << 24) |
+    ((mac[offset + 1] ?? 0) << 16) |
+    ((mac[offset + 2] ?? 0) << 8) |
+    (mac[offset + 3] ?? 0)
+  return String(bin % 1_000_000).padStart(6, '0')
 }

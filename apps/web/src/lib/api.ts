@@ -61,7 +61,15 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (session) {
     // The API session is presented as the API's own cookie. This server holds it
     // so the browser does not have to, and so the API never has to be reachable
-    // from the browser.
+    // from the browser. Both values were validated on decode (see session.ts),
+    // but re-check the alphabet here so a caller that constructs a WebSession
+    // by hand cannot turn it into header injection.
+    if (!/^sess_[A-Za-z0-9_-]{1,200}$/.test(session.apiSession)) {
+      throw new ApiError(401, 'UNAUTHORIZED', 'Not signed in.')
+    }
+    if (!/^[A-Za-z0-9_-]{1,256}$/.test(session.apiCsrf)) {
+      throw new ApiError(401, 'UNAUTHORIZED', 'Not signed in.')
+    }
     headers['Cookie'] = `${config.apiCookieName}=${session.apiSession}`
     if (method !== 'GET' && method !== 'HEAD') {
       headers['X-CSRF-Token'] = session.apiCsrf
@@ -121,11 +129,21 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 // --- Authentication -------------------------------------------------------
 
 /** Exchanges credentials for an API session. */
-export async function login(username: string, password: string): Promise<SessionInfo & { apiCookie: string }> {
+export async function login(
+  username: string,
+  password: string,
+  totpCode?: string,
+  backupCode?: string,
+): Promise<SessionInfo & { apiCookie: string }> {
   const response = await fetch(`${config.apiUrl}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({
+      username,
+      password,
+      ...(totpCode ? { totp_code: totpCode } : {}),
+      ...(backupCode ? { backup_code: backupCode } : {}),
+    }),
     cache: 'no-store',
   })
 
@@ -319,6 +337,75 @@ export function deleteRule(session: WebSession, id: string) {
 
 export function reloadRules(session: WebSession) {
   return request<{ rules: number; status: string }>('/rules/reload', { session, method: 'POST' })
+}
+
+export function mfaStatus(session: WebSession, signal?: AbortSignal) {
+  return request<{ enabled: boolean; enrolled_at?: string }>('/auth/mfa/status', { session, signal })
+}
+
+export function mfaSetup(session: WebSession) {
+  return request<{ secret: string; otpauth_url: string }>('/auth/mfa/setup', { session, method: 'POST' })
+}
+
+export function mfaEnable(session: WebSession, code: string) {
+  return request<{ backup_codes: string[] }>('/auth/mfa/enable', { session, method: 'POST', body: { code } })
+}
+
+export function mfaDisable(session: WebSession, password: string, code: string) {
+  return request<{ status: string }>('/auth/mfa/disable', {
+    session,
+    method: 'POST',
+    body: { password, code },
+  })
+}
+
+export interface PasskeySummary {
+  id: string
+  name?: string
+  created_at: string
+  last_used_at?: string
+  sign_count: number
+  transports?: string[]
+}
+
+export function listPasskeys(session: WebSession, signal?: AbortSignal) {
+  return request<{ passkeys: PasskeySummary[] }>('/auth/webauthn/credentials', { session, signal })
+}
+
+export function passkeyRegisterBegin(session: WebSession) {
+  return request<{
+    challenge: string
+    rp: { id: string; name: string }
+    user: { id: string; name: string; displayName: string }
+    excludeCredentials: Array<{ type: string; id: string }>
+  }>('/auth/webauthn/register/begin', { session, method: 'POST' })
+}
+
+export function passkeyRegisterComplete(
+  session: WebSession,
+  payload: { challenge: string; id: string; name: string; transports: string[]; clientDataJSON: string; attestationObject: string },
+) {
+  return request<{ credential_id: string; name: string }>('/auth/webauthn/register/complete', {
+    session,
+    method: 'POST',
+    body: {
+      challenge: payload.challenge,
+      id: payload.id,
+      name: payload.name,
+      transports: payload.transports,
+      response: {
+        clientDataJSON: payload.clientDataJSON,
+        attestationObject: payload.attestationObject,
+      },
+    },
+  })
+}
+
+export function deletePasskey(session: WebSession, id: string) {
+  return request<{ status: string }>(`/auth/webauthn/credentials/${encodeURIComponent(id)}`, {
+    session,
+    method: 'DELETE',
+  })
 }
 
 // --- Helpers --------------------------------------------------------------

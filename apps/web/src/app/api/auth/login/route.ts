@@ -11,7 +11,7 @@ import { writeSession } from '@/lib/session'
 // dashboard cookie cannot be replayed against the API directly.
 
 export async function POST(request: Request) {
-  let payload: { username?: unknown; password?: unknown }
+  let payload: { username?: unknown; password?: unknown; totp_code?: unknown; backup_code?: unknown }
   try {
     payload = (await request.json()) as typeof payload
   } catch {
@@ -20,6 +20,8 @@ export async function POST(request: Request) {
 
   const username = typeof payload.username === 'string' ? payload.username.trim().toLowerCase() : ''
   const password = typeof payload.password === 'string' ? payload.password : ''
+  const totpCode = typeof payload.totp_code === 'string' ? payload.totp_code.trim() : ''
+  const backupCode = typeof payload.backup_code === 'string' ? payload.backup_code.trim() : ''
 
   if (!username || !password) {
     return NextResponse.json(
@@ -29,7 +31,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = await login(username, password)
+    const result = await login(username, password, totpCode || undefined, backupCode || undefined)
 
     await writeSession({
       apiSession: result.apiCookie,

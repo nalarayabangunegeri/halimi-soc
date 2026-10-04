@@ -177,7 +177,7 @@ export interface Analysis {
 }
 
 export interface SessionInfo {
-  user: { id: string; username: string; role: 'ADMIN' | 'ANALYST' | 'READONLY' }
+  user: { id: string; username: string; role: 'ADMIN' | 'ANALYST' | 'READONLY'; mfa_enabled?: boolean }
   csrf_token: string
   expires_at: string
 }

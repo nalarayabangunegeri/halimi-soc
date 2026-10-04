@@ -19,12 +19,12 @@ test.describe('authentication', () => {
 
     await page.getByLabel('Username').fill('admin')
     await page.getByLabel('Password').fill('definitely-wrong-password')
-    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click()
     const knownAccountError = await page.locator('.error-banner').textContent()
 
     await page.getByLabel('Username').fill('no-such-operator')
     await page.getByLabel('Password').fill('definitely-wrong-password')
-    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click()
     const unknownAccountError = await page.locator('.error-banner').textContent()
 
     // The two responses must be indistinguishable, or the login form is an account

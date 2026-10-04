@@ -61,14 +61,25 @@ export function decodeSession(value: string): WebSession | null {
 function isWebSession(value: unknown): value is WebSession {
   if (typeof value !== 'object' || value === null) return false
   const v = value as Record<string, unknown>
-  return (
-    typeof v.apiSession === 'string' &&
-    v.apiSession.length > 0 &&
-    typeof v.apiCsrf === 'string' &&
-    typeof v.username === 'string' &&
-    (v.role === 'ADMIN' || v.role === 'ANALYST' || v.role === 'READONLY') &&
-    typeof v.expiresAt === 'string'
+  if (
+    typeof v.apiSession !== 'string' ||
+    typeof v.apiCsrf !== 'string' ||
+    typeof v.username !== 'string' ||
+    typeof v.expiresAt !== 'string'
   )
+    return false
+  // Strict charset: the decoded web cookie is attacker-controllable (unsigned
+  // base64), and apiSession is later interpolated into a Cookie header in
+  // lib/api.ts. Reject anything outside the token alphabet so a tampered
+  // cookie cannot inject ';', whitespace or CRLF into that header. Real tokens
+  // are sess_ + base64url and CSRF is base64url; the test fixtures
+  // (sess_value, csrf_value) use the same alphabet.
+  if (!/^sess_[A-Za-z0-9_-]{1,200}$/.test(v.apiSession)) return false
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(v.apiCsrf)) return false
+  if (!/^[a-z0-9._-]{3,64}$/.test(v.username)) return false
+  if (!(v.role === 'ADMIN' || v.role === 'ANALYST' || v.role === 'READONLY')) return false
+  if (Number.isNaN(Date.parse(v.expiresAt))) return false
+  return true
 }
 
 /** Reads the session from the request cookies. */

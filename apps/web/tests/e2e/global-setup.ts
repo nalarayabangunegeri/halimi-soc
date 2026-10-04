@@ -26,6 +26,7 @@ const APP_TABLES = [
   'agent_tokens',
   'agents',
   'sessions',
+  'passkeys',
   'users',
 ]
 
@@ -99,6 +100,12 @@ export default async function globalSetup(): Promise<void> {
       HALIMISOC_AGENT_ENROLL_SECRET: ENROLL_SECRET,
       HALIMISOC_RULES_PATH: 'packages/rules',
       HALIMISOC_LOG_LEVEL: 'info',
+      // Browsers reject an IP literal as a WebAuthn RP ID ("invalid domain"),
+      // so the suite pins a hostname RP and drives that origin in the passkey
+      // spec. The Go suites keep the 127.0.0.1 default; this only affects the
+      // API process spawned here.
+      HALIMISOC_WEBAUTHN_RP_ID: 'localhost',
+      HALIMISOC_WEBAUTHN_ORIGINS: 'http://localhost:3100',
     },
     stdio: 'ignore',
     detached: true,

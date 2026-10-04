@@ -2,8 +2,14 @@ import { NextResponse } from 'next/server'
 import {
   analyzeIncident,
   ApiError,
+  deletePasskey,
   deleteRule,
   getRuleBody,
+  mfaDisable,
+  mfaEnable,
+  mfaSetup,
+  passkeyRegisterBegin,
+  passkeyRegisterComplete,
   reloadRules,
   revokeAgent,
   rotateAgentToken,
@@ -54,11 +60,63 @@ const ACTIONS: Record<string, Dispatch> = {
   'rules.save': (session, id, payload) => saveRule(session, id, readYaml(payload)),
   'rules.delete': (session, id) => deleteRule(session, id),
   'rules.reload': (session) => reloadRules(session),
+  'mfa.setup': (session) => mfaSetup(session),
+  'mfa.enable': (session, _id, payload) => mfaEnable(session, readCode(payload)),
+  'mfa.disable': (session, _id, payload) => {
+    const password = typeof payload.password === 'string' ? payload.password : ''
+    if (!password) throw new ApiError(400, 'BAD_REQUEST', 'Current password is required.')
+    return mfaDisable(session, password, readCode(payload))
+  },
+  'passkey.register.begin': (session) => passkeyRegisterBegin(session),
+  'passkey.register.complete': (session, _id, payload) => {
+    const challenge = typeof payload.challenge === 'string' ? payload.challenge : ''
+    const id = typeof payload.id === 'string' ? payload.id : ''
+    const name = typeof payload.name === 'string' ? payload.name : ''
+    const transports = Array.isArray(payload.transports)
+      ? (payload.transports as unknown[]).filter((t): t is string => typeof t === 'string').slice(0, 8)
+      : []
+    const response = payload.response as { clientDataJSON?: unknown; attestationObject?: unknown } | undefined
+    const clientDataJSON = response && typeof response.clientDataJSON === 'string' ? response.clientDataJSON : ''
+    const attestationObject =
+      response && typeof response.attestationObject === 'string' ? response.attestationObject : ''
+    if (!challenge || !id || !clientDataJSON || !attestationObject) {
+      throw new ApiError(400, 'BAD_REQUEST', 'Challenge and attestation are required.')
+    }
+    if (id.length > 2048 || clientDataJSON.length > 131072 || attestationObject.length > 262144) {
+      throw new ApiError(400, 'BAD_REQUEST', 'Attestation too large.')
+    }
+    return passkeyRegisterComplete(session, {
+      challenge,
+      id,
+      name,
+      transports,
+      clientDataJSON,
+      attestationObject,
+    })
+  },
+  'passkey.delete': (session, id) => deletePasskey(session, id),
+}
+
+function readCode(payload: Record<string, unknown>): string {
+  const code = payload.code
+  if (typeof code !== 'string' || code.trim().length === 0 || code.length > 64) {
+    throw new ApiError(400, 'BAD_REQUEST', 'A verification code is required.')
+  }
+  return code.trim()
 }
 
 // Actions that carry their input in the payload rather than the URL: a YAML
-// document has no place in a resource id.
-const PAYLOAD_ACTIONS = new Set(['rules.validate', 'rules.reload'])
+// document has no place in a resource id, and neither do MFA/passkey
+// ceremonies, which address the caller's own account rather than a URL id.
+const PAYLOAD_ACTIONS = new Set([
+  'rules.validate',
+  'rules.reload',
+  'mfa.setup',
+  'mfa.enable',
+  'mfa.disable',
+  'passkey.register.begin',
+  'passkey.register.complete',
+])
 
 function readYaml(payload: Record<string, unknown>): string {
   const yaml = payload.yaml
