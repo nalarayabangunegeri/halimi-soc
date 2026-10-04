@@ -29,6 +29,22 @@ const (
 	argonSaltLen   = 16
 )
 
+// Password length bounds.
+//
+// MinPasswordLength matches the API and bootstrap minimum: a shorter password
+// is rejected before any hashing work happens. MaxPasswordLength bounds the
+// Argon2id work an unauthenticated caller can trigger: without it a single
+// 8 KiB password on the login path costs ~64 MiB + CPU, which is a cheap
+// CPU/RAM DoS. 128 characters is far above any memorable passphrase.
+const (
+	MinPasswordLength = 12
+	MaxPasswordLength = 128
+)
+
+// ErrPasswordTooLong means the password exceeds MaxPasswordLength and was
+// rejected without hashing to bound unauthenticated CPU/RAM work.
+var ErrPasswordTooLong = errors.New("password exceeds maximum length")
+
 // ErrInvalidHash means a stored hash is not in the expected PHC string format.
 var ErrInvalidHash = errors.New("invalid password hash format")
 
@@ -42,6 +58,12 @@ var ErrIncompatibleVersion = errors.New("incompatible argon2 version")
 func HashPassword(password string) (string, error) {
 	if password == "" {
 		return "", errors.New("password must not be empty")
+	}
+	if len(password) < MinPasswordLength {
+		return "", errors.New("password must be at least 12 characters")
+	}
+	if len(password) > MaxPasswordLength {
+		return "", ErrPasswordTooLong
 	}
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
@@ -62,7 +84,13 @@ func HashPassword(password string) (string, error) {
 // The comparison is constant time. A malformed or unsupported hash is reported
 // as a non-match and as an error, so the caller can distinguish "wrong password"
 // from "corrupt credential store".
+//
+// An overlong password is rejected fast without running Argon2id: hashing it
+// would let an unauthenticated caller burn ~64 MiB + CPU per attempt.
 func VerifyPassword(password, encoded string) (bool, error) {
+	if len(password) > MaxPasswordLength {
+		return false, nil
+	}
 	params, salt, want, err := decodeHash(encoded)
 	if err != nil {
 		return false, err

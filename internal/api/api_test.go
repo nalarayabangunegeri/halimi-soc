@@ -823,7 +823,10 @@ func TestAnalyzeIncidentDoesNotChangeState(t *testing.T) {
 	res := decode[ingestResult](t, h.do(http.MethodPost, "/api/v1/events", batch, h.agentHeaders()))
 	incidentID := res.Incidents[0].ID
 
-	h.login("admin", adminPassword)
+	// Analyse requires CSRF (audit + billable LLM), so present it like the
+	// dashboard BFF does.
+	csrf, _ := h.login("admin", adminPassword)
+	headers := map[string]string{"X-CSRF-Token": csrf}
 
 	before := decode[struct {
 		Status   string `json:"status"`
@@ -832,7 +835,7 @@ func TestAnalyzeIncidentDoesNotChangeState(t *testing.T) {
 
 	// Analyse several times.
 	for i := 0; i < 3; i++ {
-		resp := h.do(http.MethodPost, "/api/v1/incidents/"+incidentID+"/analyze", nil, nil)
+		resp := h.do(http.MethodPost, "/api/v1/incidents/"+incidentID+"/analyze", nil, headers)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("analyze %d status = %d", i, resp.StatusCode)
 		}

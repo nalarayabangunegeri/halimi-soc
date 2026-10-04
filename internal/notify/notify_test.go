@@ -36,6 +36,9 @@ func TestValidate(t *testing.T) {
 	}{
 		{"ftp scheme", notify.Options{URL: "ftp://example.test/hook", Timeout: time.Second, QueueSize: 1}},
 		{"credentials in url", notify.Options{URL: "https://user:pass@example.test/hook", Timeout: time.Second, QueueSize: 1}},
+		{"metadata ip", notify.Options{URL: "http://169.254.169.254/latest/meta-data/", Timeout: time.Second, QueueSize: 1}},
+		{"metadata name", notify.Options{URL: "http://metadata.google.internal/", Timeout: time.Second, QueueSize: 1}},
+		{"short secret", notify.Options{URL: "https://example.test/hook", Secret: "short", Timeout: time.Second, QueueSize: 1}},
 		{"non-positive timeout", notify.Options{URL: "https://example.test/hook", QueueSize: 1}},
 		{"non-positive queue", notify.Options{URL: "https://example.test/hook", Timeout: time.Second}},
 	} {
@@ -45,6 +48,44 @@ func TestValidate(t *testing.T) {
 	}
 	if err := (notify.Options{URL: "https://example.test/hook", Timeout: time.Second, QueueSize: 1}).Validate(); err != nil {
 		t.Fatalf("valid options = %v, want nil", err)
+	}
+}
+
+func TestWebhookSignatureIsVerified(t *testing.T) {
+	body := []byte(`{"event":"incident.created"}`)
+	sig := notify.SignBody("a-very-long-test-secret-123", body)
+	if !notify.VerifySignature("a-very-long-test-secret-123", body, sig) {
+		t.Fatal("valid signature rejected")
+	}
+	if notify.VerifySignature("a-very-long-test-secret-123", body, sig+"00") {
+		t.Fatal("forged signature accepted")
+	}
+	if notify.VerifySignature("wrong-secret-value-12345", body, sig) {
+		t.Fatal("wrong secret accepted")
+	}
+}
+
+func TestSignedDeliveryCarriesSignature(t *testing.T) {
+	var sig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sig = r.Header.Get("X-HalimiSOC-Signature")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	reg := metrics.New()
+	n := notify.New(notify.Options{URL: srv.URL, Secret: "a-very-long-test-secret-123", Timeout: 5 * time.Second, QueueSize: 8, Registry: reg})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go n.Run(ctx)
+	n.NotifyIncident(testIncident())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for reg.Counter(metrics.WebhookSentTotal) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sig == "" || len(sig) < 10 {
+		t.Fatalf("signed delivery missing signature: %q", sig)
 	}
 }
 

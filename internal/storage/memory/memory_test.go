@@ -15,6 +15,7 @@ import (
 	"github.com/halimi/halimisoc/internal/incidents"
 	"github.com/halimi/halimisoc/internal/storage"
 	memorystore "github.com/halimi/halimisoc/internal/storage/memory"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 func ctx() context.Context { return context.Background() }
@@ -530,5 +531,167 @@ func TestIncidentSourceIPsRoundTrip(t *testing.T) {
 	}
 	if len(got.SourceIPs) != 1 || got.SourceIPs[0] != "203.0.113.7" {
 		t.Fatalf("source_ips did not round-trip: %v", got.SourceIPs)
+	}
+}
+
+func TestPasskeyCRUDAndConflict(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	p := &webauthn.Passkey{
+		ID: "cred_db_1", UserID: "usr_a", CredentialID: "cred-wire-1",
+		PublicKey: "cose-blob", SignCount: 0, Transports: []string{"internal"},
+		Name: "laptop", CreatedAt: now,
+	}
+	if err := s.SavePasskey(ctx(), p); err != nil {
+		t.Fatal(err)
+	}
+	// A second row for the same wire credential conflicts: one authenticator
+	// must not be enrolled twice under two ids.
+	dup := &webauthn.Passkey{
+		ID: "cred_db_2", UserID: "usr_a", CredentialID: "cred-wire-1",
+		PublicKey: "cose-blob", CreatedAt: now,
+	}
+	if err := s.SavePasskey(ctx(), dup); err == nil {
+		t.Fatal("duplicate credential id accepted")
+	}
+
+	got, err := s.GetPasskeyByCredentialID(ctx(), "cred-wire-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserID != "usr_a" || got.Name != "laptop" {
+		t.Fatalf("passkey = %+v", got)
+	}
+	// Mutating the returned copy must not corrupt the store.
+	got.Transports[0] = "usb"
+	fresh, err := s.GetPasskeyByCredentialID(ctx(), "cred-wire-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Transports[0] != "internal" {
+		t.Fatal("stored passkey mutated through a returned copy")
+	}
+
+	list, err := s.ListPasskeysByUser(ctx(), "usr_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("passkeys = %d, want 1", len(list))
+	}
+
+	if err := s.UpdatePasskeyCounter(ctx(), "cred_db_1", 7, now); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.GetPasskeyByCredentialID(ctx(), "cred-wire-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.SignCount != 7 || after.LastUsedAt == nil {
+		t.Fatalf("counter = %d/%v", after.SignCount, after.LastUsedAt)
+	}
+	if err := s.UpdatePasskeyCounter(ctx(), "missing", 1, now); err == nil {
+		t.Error("counter update on missing passkey accepted")
+	}
+
+	if err := s.DeletePasskey(ctx(), "cred_db_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePasskey(ctx(), "cred_db_1"); err == nil {
+		t.Error("double delete accepted")
+	}
+	if _, err := s.GetPasskeyByCredentialID(ctx(), "cred-wire-1"); err == nil {
+		t.Error("deleted passkey still resolvable")
+	}
+	if err := s.SavePasskey(ctx(), nil); err == nil {
+		t.Error("nil passkey accepted")
+	}
+}
+
+func TestSessionTouchAndUserSessionRevocation(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	sess := &auth.Session{
+		ID: "sess_1", UserID: "usr_a", TokenHash: "hash", CSRFToken: "csrf",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour), LastSeenAt: now,
+	}
+	if err := s.SaveSession(ctx(), sess); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(30 * time.Minute)
+	if err := s.TouchSession(ctx(), "sess_1", later); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSession(ctx(), "sess_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LastSeenAt.Equal(later) {
+		t.Fatalf("last_seen = %v, want %v", got.LastSeenAt, later)
+	}
+	if err := s.TouchSession(ctx(), "missing", later); err == nil {
+		t.Error("touch on missing session accepted")
+	}
+
+	second := &auth.Session{
+		ID: "sess_2", UserID: "usr_a", TokenHash: "hash", CSRFToken: "csrf",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour), LastSeenAt: now,
+	}
+	if err := s.SaveSession(ctx(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeUserSessions(ctx(), "usr_a", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"sess_1", "sess_2"} {
+		revoked, err := s.GetSession(ctx(), sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !revoked.Revoked() {
+			t.Errorf("session %s not revoked", sid)
+		}
+	}
+}
+
+func TestUserBackupHashesAreIsolated(t *testing.T) {
+	s := memorystore.New()
+	now := time.Now().UTC()
+	u := &auth.User{
+		ID: "usr_a", Username: "alice", PasswordHash: "hash",
+		Role: authorization.RoleAnalyst, CreatedAt: now,
+		BackupHashes: []string{"h1", "h2"},
+	}
+	if err := s.SaveUser(ctx(), u); err != nil {
+		t.Fatal(err)
+	}
+	// Mutating the caller's slice after save must not leak into the store.
+	u.BackupHashes[0] = "tampered"
+	got, err := s.GetUser(ctx(), "usr_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BackupHashes[0] != "h1" {
+		t.Fatal("backup hashes aliased the caller's slice")
+	}
+	got.BackupHashes[0] = "tampered"
+	fresh, err := s.GetUserByUsername(ctx(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.BackupHashes[0] != "h1" {
+		t.Fatal("backup hashes mutated through a returned copy")
+	}
+	list, err := s.ListUsers(ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	list[0].BackupHashes[0] = "tampered"
+	again, err := s.GetUser(ctx(), "usr_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.BackupHashes[0] != "h1" {
+		t.Fatal("backup hashes mutated through a listed copy")
 	}
 }

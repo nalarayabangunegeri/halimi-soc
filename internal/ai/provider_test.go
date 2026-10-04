@@ -22,6 +22,15 @@ func TestProviderRequiresConfiguration(t *testing.T) {
 	if _, err := ai.NewOpenAICompatibleProvider(ai.ProviderOptions{BaseURL: "https://x.test"}); err == nil {
 		t.Error("expected an error when the model is missing")
 	}
+	if _, err := ai.NewOpenAICompatibleProvider(ai.ProviderOptions{BaseURL: "http://169.254.169.254/", Model: "m"}); err == nil {
+		t.Error("metadata endpoint accepted; want rejection")
+	}
+	if _, err := ai.NewOpenAICompatibleProvider(ai.ProviderOptions{BaseURL: "http://remote.example.test/v1", Model: "m"}); err == nil {
+		t.Error("cleartext remote provider accepted; want https")
+	}
+	if _, err := ai.NewOpenAICompatibleProvider(ai.ProviderOptions{BaseURL: "http://127.0.0.1:11434/v1", Model: "m"}); err != nil {
+		t.Errorf("loopback http rejected: %v", err)
+	}
 }
 
 func TestProviderComplete(t *testing.T) {

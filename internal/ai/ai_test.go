@@ -388,3 +388,49 @@ func TestProviderReceivesThePrompt(t *testing.T) {
 		t.Error("the prompt does not identify the incident")
 	}
 }
+
+type blockingProvider struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingProvider) Name() string { return "blocking" }
+
+func (b *blockingProvider) Complete(ctx context.Context, _, _ string) (string, error) {
+	close(b.entered)
+	select {
+	case <-b.release:
+		return "done", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// M7: concurrent analyze calls are bounded; the excess degrades to the
+// computed fallback instead of queueing unbounded LLM cost.
+func TestConcurrentAnalyzeIsBounded(t *testing.T) {
+	block := &blockingProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	a := ai.New(ai.Options{Provider: block, MaxConcurrent: 1})
+
+	firstDone := make(chan ai.Result, 1)
+	go func() {
+		res, _ := a.Analyze(context.Background(), ai.Request{Incident: sampleIncident(), Evidence: sampleEvidence()})
+		firstDone <- res
+	}()
+	<-block.entered
+
+	// Second call while the first holds the single slot must not call the
+	// provider; it degrades immediately.
+	second, err := a.Analyze(context.Background(), ai.Request{Incident: sampleIncident(), Evidence: sampleEvidence()})
+	if err != nil {
+		t.Fatalf("bounded analyze = %v, want degraded result", err)
+	}
+	if second.Mode != ai.ModeUnavailable {
+		t.Fatalf("mode = %s, want UNAVAILABLE when the concurrency bound is hit", second.Mode)
+	}
+	close(block.release)
+	first := <-firstDone
+	if first.Mode != ai.ModeProvider {
+		t.Fatalf("first mode = %s, want PROVIDER", first.Mode)
+	}
+}

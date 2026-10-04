@@ -32,29 +32,36 @@ import (
 	"github.com/halimi/halimisoc/internal/notify"
 	"github.com/halimi/halimisoc/internal/secret"
 	"github.com/halimi/halimisoc/internal/storage"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 // Server wires the HTTP surface.
 type Server struct {
-	store         storage.Store
-	ingester      *ingest.Ingester
-	detector      *engine.Engine
-	limits        config.Limits
-	sessionTTL    time.Duration
-	clockSkew     time.Duration
-	log           *slog.Logger
-	reg           *metrics.Registry
-	limiter       *auth.Limiter
-	now           func() time.Time
-	analyst       *ai.Analyst
-	hub           *stream.Hub
-	enrollSecret  string
-	appVersion    string
-	startedAt     time.Time
-	cookieName    string
-	secureCookies bool
-	rulesPath     string
-	notifier      *notify.Notifier
+	store          storage.Store
+	ingester       *ingest.Ingester
+	detector       *engine.Engine
+	limits         config.Limits
+	sessionTTL     time.Duration
+	sessionIdle    time.Duration
+	clockSkew      time.Duration
+	log            *slog.Logger
+	reg            *metrics.Registry
+	limiter        *auth.Limiter
+	analyzeLimiter *auth.Limiter
+	now            func() time.Time
+	analyst        *ai.Analyst
+	hub            *stream.Hub
+	enrollSecret   string
+	appVersion     string
+	startedAt      time.Time
+	cookieName     string
+	secureCookies  bool
+	rulesPath      string
+	notifier       *notify.Notifier
+	metricsToken   string
+	mfaKey         []byte
+	webauthn       webauthn.Config
+	challenges     *webauthn.Challenges
 
 	mux *http.ServeMux
 }
@@ -66,6 +73,7 @@ type Options struct {
 	Detector      *engine.Engine
 	Limits        config.Limits
 	SessionTTL    time.Duration
+	SessionIdle   time.Duration
 	ClockSkew     time.Duration
 	Logger        *slog.Logger
 	Metrics       *metrics.Registry
@@ -74,6 +82,17 @@ type Options struct {
 	EnrollSecret  string
 	Version       string
 	SecureCookies bool
+	// MetricsToken guards /metrics when set. Empty leaves it unauthenticated.
+	MetricsToken string
+	// MFAKey encrypts TOTP secrets at rest (32 bytes, AES-256-GCM). Empty
+	// stores secrets with a "plain:" prefix (dev only); production with MFA
+	// should set HALIMISOC_MFA_KEY.
+	MFAKey []byte
+	// WebAuthn is the passkey RP config. Zero value disables? No: New defaults
+	// it to loopback dev values so tests and dev work without env.
+	WebAuthn webauthn.Config
+	// Challenges overrides the default in-memory challenge store (tests).
+	Challenges *webauthn.Challenges
 	// RulesPath is the directory rule reloads are read from. Empty disables
 	// the reload endpoint rather than reloading from a guess.
 	RulesPath string
@@ -94,6 +113,15 @@ func New(opts Options) *Server {
 	ttl := opts.SessionTTL
 	if ttl <= 0 {
 		ttl = 12 * time.Hour
+	}
+	idle := opts.SessionIdle
+	if idle <= 0 {
+		idle = 2 * time.Hour
+	}
+	// Idle must never exceed the absolute TTL: an idle window longer than the
+	// session lifetime is dead configuration that suggests a misunderstanding.
+	if idle > ttl {
+		idle = ttl
 	}
 	skew := opts.ClockSkew
 	if skew <= 0 {
@@ -117,17 +145,25 @@ func New(opts Options) *Server {
 	}
 
 	s := &Server{
-		store:         opts.Store,
-		analyst:       analyst,
-		hub:           hub,
-		ingester:      opts.Ingester,
-		detector:      opts.Detector,
-		limits:        opts.Limits,
-		sessionTTL:    ttl,
-		clockSkew:     skew,
-		log:           log,
-		reg:           reg,
-		limiter:       auth.NewLimiter(auth.DefaultLimiterOptions()),
+		store:       opts.Store,
+		analyst:     analyst,
+		hub:         hub,
+		ingester:    opts.Ingester,
+		detector:    opts.Detector,
+		limits:      opts.Limits,
+		sessionTTL:  ttl,
+		sessionIdle: idle,
+		clockSkew:   skew,
+		log:         log,
+		reg:         reg,
+		limiter:     auth.NewLimiter(auth.DefaultLimiterOptions()),
+		analyzeLimiter: auth.NewLimiter(auth.LimiterOptions{
+			MaxAttempts: 10,
+			BaseDelay:   30 * time.Second,
+			MaxDelay:    5 * time.Minute,
+			ResetAfter:  10 * time.Minute,
+			MaxEntries:  10_000,
+		}),
 		now:           func() time.Time { return time.Now().UTC() },
 		enrollSecret:  opts.EnrollSecret,
 		appVersion:    opts.Version,
@@ -136,7 +172,23 @@ func New(opts Options) *Server {
 		secureCookies: opts.SecureCookies,
 		rulesPath:     opts.RulesPath,
 		notifier:      opts.Notifier,
+		metricsToken:  opts.MetricsToken,
+		mfaKey:        opts.MFAKey,
+		webauthn:      opts.WebAuthn,
+		challenges:    opts.Challenges,
 		mux:           http.NewServeMux(),
+	}
+	if s.webauthn.RPID == "" {
+		s.webauthn.RPID = "127.0.0.1"
+	}
+	if s.webauthn.RPName == "" {
+		s.webauthn.RPName = "HalimiSOC"
+	}
+	if len(s.webauthn.Origins) == 0 {
+		s.webauthn.Origins = []string{"http://127.0.0.1:3000", "http://localhost:3000"}
+	}
+	if s.challenges == nil {
+		s.challenges = webauthn.NewChallenges(10000, 5*time.Minute)
 	}
 	s.routes()
 	return s
@@ -144,6 +196,9 @@ func New(opts Options) *Server {
 
 // SetClock overrides the clock. Test-only.
 func (s *Server) SetClock(f func() time.Time) { s.now = f }
+
+// SetMetricsTokenForTest overrides the /metrics bearer token. Test-only.
+func (s *Server) SetMetricsTokenForTest(token string) { s.metricsToken = token }
 
 // SetNotifier swaps the webhook notifier. Test-only.
 func (s *Server) SetNotifier(n *notify.Notifier) { s.notifier = n }
@@ -203,6 +258,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/users", s.handleListUsers)
 	s.mux.HandleFunc("POST /api/v1/users", s.handleCreateUser)
 	s.mux.HandleFunc("PATCH /api/v1/users/{id}/status", s.handleUpdateUserStatus)
+	s.mux.HandleFunc("POST /api/v1/auth/password", s.handleChangeOwnPassword)
+	s.mux.HandleFunc("PATCH /api/v1/users/{id}/password", s.handleResetUserPassword)
+	s.mux.HandleFunc("GET /api/v1/auth/mfa/status", s.handleMFAStatus)
+	s.mux.HandleFunc("POST /api/v1/auth/mfa/setup", s.handleMFASetup)
+	s.mux.HandleFunc("POST /api/v1/auth/mfa/enable", s.handleMFAEnable)
+	s.mux.HandleFunc("POST /api/v1/auth/mfa/disable", s.handleMFADisable)
+	s.mux.HandleFunc("POST /api/v1/users/{id}/mfa/reset", s.handleMFAReset)
+	s.mux.HandleFunc("POST /api/v1/auth/webauthn/register/begin", s.handlePasskeyRegisterBegin)
+	s.mux.HandleFunc("POST /api/v1/auth/webauthn/register/complete", s.handlePasskeyRegisterComplete)
+	s.mux.HandleFunc("GET /api/v1/auth/webauthn/credentials", s.handlePasskeyList)
+	s.mux.HandleFunc("DELETE /api/v1/auth/webauthn/credentials/{id}", s.handlePasskeyDelete)
+	s.mux.HandleFunc("POST /api/v1/auth/webauthn/login/begin", s.handlePasskeyLoginBegin)
+	s.mux.HandleFunc("POST /api/v1/auth/webauthn/login/complete", s.handlePasskeyLoginComplete)
 
 	s.mux.HandleFunc("GET /api/v1/stream", s.handleStream)
 }
@@ -224,6 +292,7 @@ type ErrorDetail struct {
 const (
 	CodeBadRequest   = "BAD_REQUEST"
 	CodeUnauthorized = "UNAUTHORIZED"
+	CodeMFARequired  = "MFA_REQUIRED"
 	CodeForbidden    = "FORBIDDEN"
 	CodeNotFound     = "NOT_FOUND"
 	CodeConflict     = "CONFLICT"
@@ -414,11 +483,26 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) *principal
 		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "session is no longer valid")
 		return nil
 	}
+	// Idle timeout bounds a stolen cookie even when the absolute TTL is long.
+	// A session unused for longer than sessionIdle is treated as expired.
+	if sess.IdleExpired(now, s.sessionIdle) {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "session is no longer valid")
+		return nil
+	}
 
 	user, err := s.store.GetUser(r.Context(), sess.UserID)
 	if err != nil || !user.Active() {
 		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "account is not active")
 		return nil
+	}
+
+	// Refresh LastSeenAt best-effort so idle is measured from real activity.
+	// A store failure here must not fail the request: the session already
+	// authenticated, and failing open on activity tracking is safe.
+	if err := s.store.TouchSession(r.Context(), sess.ID, now); err != nil {
+		s.log.Warn("touch session failed", "session", sess.ID, "error", err)
+	} else {
+		sess.LastSeenAt = now
 	}
 
 	return &principal{

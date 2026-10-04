@@ -15,8 +15,10 @@ import (
 )
 
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	TOTPCode   string `json:"totp_code"`
+	BackupCode string `json:"backup_code"`
 }
 
 type loginResponse struct {
@@ -26,9 +28,10 @@ type loginResponse struct {
 }
 
 type userView struct {
-	ID       string             `json:"id"`
-	Username string             `json:"username"`
-	Role     authorization.Role `json:"role"`
+	ID         string             `json:"id"`
+	Username   string             `json:"username"`
+	Role       authorization.Role `json:"role"`
+	MFAEnabled bool               `json:"mfa_enabled"`
 }
 
 // handleLogin authenticates an operator and starts a session.
@@ -48,6 +51,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// the per-address key stops one host spraying many accounts.
 	accountKey := "acct:" + username
 	ipKey := "ip:" + ip
+
+	// Bound the password before any Argon2id work: VerifyPassword fast-rejects
+	// overlong values, but rejecting here keeps the failure path explicit and
+	// avoids even the dummy-hash timing branch for absurd inputs.
+	if len(req.Password) > auth.MaxPasswordLength {
+		s.limiter.Fail(accountKey, now)
+		s.limiter.Fail(ipKey, now)
+		s.recordLoginFailure(r, username, "password exceeds maximum length")
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid credentials")
+		return
+	}
 
 	if wait := s.limiter.RetryAfter(accountKey, now); wait > 0 {
 		s.recordLoginFailure(r, username, "account throttled")
@@ -91,6 +105,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Second factor after a correct password. Wrong/missing codes fail with the
+	// same 401 shape; missing codes use MFA_REQUIRED so the UI can prompt.
+	if !s.verifyLoginMFA(w, r, user, req.TOTPCode, req.BackupCode, accountKey, ipKey, now) {
+		return
+	}
+
 	s.limiter.Succeed(accountKey)
 	s.limiter.Succeed(ipKey)
 
@@ -128,7 +148,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, loginResponse{
-		User:      userView{ID: user.ID, Username: user.Username, Role: user.Role},
+		User:      userView{ID: user.ID, Username: user.Username, Role: user.Role, MFAEnabled: user.TOTPEnabled},
 		CSRFToken: sess.CSRFToken,
 		ExpiresAt: sess.ExpiresAt,
 	})
@@ -169,7 +189,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user":       userView{ID: p.User.ID, Username: p.User.Username, Role: p.User.Role},
+		"user":       userView{ID: p.User.ID, Username: p.User.Username, Role: p.User.Role, MFAEnabled: p.User.TOTPEnabled},
 		"csrf_token": p.Session.CSRFToken,
 		"expires_at": p.Session.ExpiresAt,
 	})

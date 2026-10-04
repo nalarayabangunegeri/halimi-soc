@@ -10,11 +10,16 @@ package notify
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/halimi/halimisoc/internal/incidents"
@@ -32,6 +37,11 @@ type Options struct {
 	// QueueSize bounds pending notifications. When full, Notify drops and
 	// counts rather than blocking the caller.
 	QueueSize int
+
+	// Secret signs the body with HMAC-SHA256 when set. The receiver verifies
+	// X-HalimiSOC-Signature to distinguish our POST from a spoof. Empty
+	// disables signing; production deployments should set ≥16 chars.
+	Secret string
 
 	// Registry receives sent/error counters. Nil disables metrics.
 	Registry *metrics.Registry
@@ -64,6 +74,12 @@ func (o Options) Validate() error {
 		// address the server is told to call.
 		return fmt.Errorf("notify: webhook url must not embed credentials")
 	}
+	if isCloudMetadataHost(u.Hostname()) {
+		return fmt.Errorf("notify: webhook url must not target cloud metadata")
+	}
+	if o.Secret != "" && len(o.Secret) < 16 {
+		return fmt.Errorf("notify: webhook secret must be at least 16 characters")
+	}
 	if o.Timeout <= 0 {
 		return fmt.Errorf("notify: timeout must be positive")
 	}
@@ -71,6 +87,35 @@ func (o Options) Validate() error {
 		return fmt.Errorf("notify: queue size must be positive")
 	}
 	return nil
+}
+
+// isCloudMetadataHost blocks the well-known cloud metadata endpoints that turn
+// a webhook URL into a credential-theft SSRF. Private intranet hosts are still
+// allowed (e.g. an internal alertmanager) — the operator chose the URL — but
+// metadata endpoints are never a legitimate incident receiver.
+func isCloudMetadataHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	switch h {
+	case "169.254.169.254", "169.254.169.253", "metadata.google.internal", "metadata.google", "metadata":
+		return true
+	}
+	return false
+}
+
+// SignBody returns the hex HMAC-SHA256 of body under secret.
+func SignBody(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifySignature compares a presented hex signature in constant time.
+func VerifySignature(secret string, body []byte, presented string) bool {
+	want := SignBody(secret, body)
+	if len(presented) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(want)) == 1
 }
 
 // Payload is the fixed webhook body.
@@ -204,6 +249,9 @@ func (n *Notifier) send(ctx context.Context, p Payload) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "halimisoc-webhook/1")
+	if n.opts.Secret != "" {
+		req.Header.Set("X-HalimiSOC-Signature", "sha256="+SignBody(n.opts.Secret, body))
+	}
 
 	resp, err := n.client.Do(req)
 	if err != nil {

@@ -118,6 +118,7 @@ func (e *Engine) Process(ctx context.Context, ev *model.Event) ([]*alerts.Alert,
 		}
 
 		if e.state.CooldownActive(rule.Key(), groupKey, rule.Cooldown, ev.Time) {
+			e.reg.Inc(metrics.DetectionSuppressedTotal, metrics.L("rule", rule.ID))
 			continue
 		}
 

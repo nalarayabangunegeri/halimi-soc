@@ -134,6 +134,19 @@ func (in *Ingester) Ingest(ctx context.Context, events []*model.Event) (*Result,
 			continue
 		}
 
+		// Past timestamps are accepted without limit for backfill legitimacy,
+		// but an event older than 24h is marked and counted so a compromised
+		// agent flooding ancient telemetry to evade the 30m correlation window
+		// is observable instead of silent. The marker uses an allowlisted
+		// attribute key and a fixed value, so it cannot carry injected content.
+		if e.Time.Before(in.now().Add(-24 * time.Hour)) {
+			in.reg.Inc(metrics.ClockSkewAnomalyTotal, metrics.L("reason", "old_timestamp"))
+			if e.Attributes == nil {
+				e.Attributes = map[string]string{}
+			}
+			e.Attributes["timestamp_old"] = "true"
+		}
+
 		inserted, err := in.store.InsertEvent(ctx, e)
 		if err != nil {
 			return res, fmt.Errorf("ingest: persist event %s: %w", e.ID, err)

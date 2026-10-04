@@ -438,3 +438,46 @@ func eventID(i int) string {
 	b[2] = alphabet[i%32]
 	return s + string(b[:])
 }
+
+// M3: a second burst inside the cooldown is suppressed as an alert but must be
+// counted, so an attacker hiding a real burst behind a trigger burst is visible
+// in metrics even when no second alert fires.
+func TestCooldownSuppressionIsCounted(t *testing.T) {
+	eng, _, reg, now := newEngine(t, bruteForceRule)
+	base := *now
+	for i := 0; i < 5; i++ {
+		if _, err := eng.Process(context.Background(), failedLogin(eventID(i), "203.0.113.7", base)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := reg.Counter(metrics.DetectionTotal); got != 1 {
+		t.Fatalf("detection_total = %v, want 1", got)
+	}
+	for i := 5; i < 10; i++ {
+		if _, err := eng.Process(context.Background(), failedLogin(eventID(i), "203.0.113.7", base.Add(10*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := reg.Counter(metrics.DetectionTotal); got != 1 {
+		t.Fatalf("second burst fired during cooldown: detection_total = %v, want 1", got)
+	}
+	if got := reg.Counter(metrics.DetectionSuppressedTotal, metrics.L("rule", "ssh-bruteforce")); got < 1 {
+		t.Fatalf("suppressed_total = %v, want >=1", got)
+	}
+}
+
+// A spray that stays under threshold is invisible by design: alerting on every
+// few failures would be noise, so the threshold is the contract. An attacker
+// who knows the rule (count 5 per 60s) can evade it with 4 per 60s.
+func TestLowAndSlowSprayDoesNotAlert(t *testing.T) {
+	eng, sink, _, now := newEngine(t, bruteForceRule)
+	base := *now
+	for i := 0; i < 4; i++ {
+		if _, err := eng.Process(context.Background(), failedLogin(eventID(i), "203.0.113.7", base.Add(time.Duration(i*15)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(sink.alerts()); got != 0 {
+		t.Fatalf("alerts = %d, want 0 for a below-threshold spray", got)
+	}
+}

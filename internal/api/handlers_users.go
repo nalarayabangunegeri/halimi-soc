@@ -22,6 +22,15 @@ type userStatusRequest struct {
 	Disabled bool `json:"disabled"`
 }
 
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+type resetPasswordRequest struct {
+	NewPassword string `json:"new_password"`
+}
+
 // handleListUsers returns every operator account. Password hashes are never
 // serialised: auth.User tags the hash json:"-", so even a broad struct dump
 // cannot leak it.
@@ -67,8 +76,12 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, CodeBadRequest, "username must be 3-64 lowercase alphanumeric characters, dots, dashes or underscores")
 		return
 	}
-	if len(req.Password) < 12 {
+	if len(req.Password) < auth.MinPasswordLength {
 		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must be at least 12 characters")
+		return
+	}
+	if len(req.Password) > auth.MaxPasswordLength {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must not exceed 128 characters")
 		return
 	}
 	role := authorization.Role(strings.ToUpper(strings.TrimSpace(req.Role)))
@@ -174,6 +187,157 @@ func (s *Server) handleUpdateUserStatus(w http.ResponseWriter, r *http.Request) 
 		Detail:     disabledDetail(req.Disabled),
 	})
 	writeJSON(w, http.StatusOK, target)
+}
+
+// handleChangeOwnPassword lets an operator rotate their own credential.
+//
+// Requires the current password so a stolen session alone is not enough to
+// lock the real owner out. On success every session for the user is revoked,
+// including the calling one: the caller must log in again. Forcing re-login
+// is deliberate — a password change signals possible compromise, and keeping
+// old sessions alive would defeat it.
+func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	p := s.authenticate(w, r)
+	if p == nil {
+		return
+	}
+	if !s.requireCSRF(w, r, p) {
+		return
+	}
+
+	var req changePasswordRequest
+	if err := s.decodeJSON(w, r, &req, 4<<10); err != nil {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "invalid request body")
+		return
+	}
+	if len(req.NewPassword) < auth.MinPasswordLength {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must be at least 12 characters")
+		return
+	}
+	if len(req.NewPassword) > auth.MaxPasswordLength {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must not exceed 128 characters")
+		return
+	}
+	if len(req.CurrentPassword) > auth.MaxPasswordLength {
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid credentials")
+		return
+	}
+
+	ok, err := auth.VerifyPassword(req.CurrentPassword, p.User.PasswordHash)
+	if err != nil {
+		s.log.Error("password verification failed", "user", p.User.ID, "error", err)
+		writeError(w, http.StatusInternalServerError, CodeInternal, "authentication is unavailable")
+		return
+	}
+	if !ok {
+		s.writeAudit(r, audit.Entry{
+			Actor:      audit.ActorRef(audit.ActorUser, p.User.Username),
+			Action:     audit.ActionUserPasswordChanged,
+			Resource:   "user",
+			ResourceID: p.User.ID,
+			Result:     audit.ResultDenied,
+			Detail:     "current password mismatch",
+		})
+		writeError(w, http.StatusUnauthorized, CodeUnauthorized, "invalid credentials")
+		return
+	}
+
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		if errors.Is(err, auth.ErrPasswordTooLong) {
+			writeError(w, http.StatusBadRequest, CodeBadRequest, "password must not exceed 128 characters")
+			return
+		}
+		s.log.Error("hash user password failed", "error", err)
+		writeError(w, http.StatusInternalServerError, CodeInternal, "could not change the password")
+		return
+	}
+	p.User.PasswordHash = hash
+	if err := s.store.SaveUser(r.Context(), p.User); err != nil {
+		s.fail(w, err, "change password")
+		return
+	}
+	if err := s.store.RevokeUserSessions(r.Context(), p.User.ID, s.now()); err != nil {
+		s.log.Warn("revoke sessions after password change failed", "user", p.User.ID, "error", err)
+	}
+	s.PublishSessionRevokedForUser(p.User.ID)
+	s.clearCookie(w)
+	s.writeAudit(r, audit.Entry{
+		Actor:      audit.ActorRef(audit.ActorUser, p.User.Username),
+		Action:     audit.ActionUserPasswordChanged,
+		Resource:   "user",
+		ResourceID: p.User.ID,
+		Result:     audit.ResultSuccess,
+		Detail:     "own password changed; all sessions revoked",
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "password_changed"})
+}
+
+// handleResetUserPassword lets an admin set a new password for another account.
+//
+// The admin path does not need the target's current password, but it can never
+// target the caller's own account (use the self-change endpoint so the current
+// password is still proven) and it revokes the target's sessions immediately.
+func (s *Server) handleResetUserPassword(w http.ResponseWriter, r *http.Request) {
+	p := s.authenticate(w, r)
+	if p == nil {
+		return
+	}
+	if !s.requirePermission(w, r, p, authorization.PermManageUsers) {
+		return
+	}
+	if !s.requireCSRF(w, r, p) {
+		return
+	}
+
+	var req resetPasswordRequest
+	if err := s.decodeJSON(w, r, &req, 4<<10); err != nil {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "invalid request body")
+		return
+	}
+	if len(req.NewPassword) < auth.MinPasswordLength {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must be at least 12 characters")
+		return
+	}
+	if len(req.NewPassword) > auth.MaxPasswordLength {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "password must not exceed 128 characters")
+		return
+	}
+
+	target, err := s.store.GetUser(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, err, "get user")
+		return
+	}
+	if target.ID == p.User.ID {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, "use the self-change endpoint to change your own password")
+		return
+	}
+
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		s.log.Error("hash user password failed", "error", err)
+		writeError(w, http.StatusInternalServerError, CodeInternal, "could not reset the password")
+		return
+	}
+	target.PasswordHash = hash
+	if err := s.store.SaveUser(r.Context(), target); err != nil {
+		s.fail(w, err, "reset password")
+		return
+	}
+	if err := s.store.RevokeUserSessions(r.Context(), target.ID, s.now()); err != nil {
+		s.log.Warn("revoke sessions after password reset failed", "user", target.ID, "error", err)
+	}
+	s.PublishSessionRevokedForUser(target.ID)
+	s.writeAudit(r, audit.Entry{
+		Actor:      audit.ActorRef(audit.ActorUser, p.User.Username),
+		Action:     audit.ActionUserPasswordReset,
+		Resource:   "user",
+		ResourceID: target.ID,
+		Result:     audit.ResultSuccess,
+		Detail:     "password reset by admin; all sessions revoked",
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "password_reset"})
 }
 
 // lastActiveAdmin reports whether id is the only remaining active admin.

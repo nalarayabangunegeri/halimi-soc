@@ -9,6 +9,7 @@ import (
 	"github.com/halimi/halimisoc/internal/audit"
 	"github.com/halimi/halimisoc/internal/authorization"
 	"github.com/halimi/halimisoc/internal/incidents"
+	"github.com/halimi/halimisoc/internal/metrics"
 )
 
 // analyzeResponse is the incident analysis payload.
@@ -41,8 +42,10 @@ type analyzeResponse struct {
 //  3. The response states its mode and whether it was grounded in evidence, so a
 //     reader can tell a model narrative from a computed one.
 //
-// It performs no state change, so it requires no CSRF token, and it grants no
-// ability to modify the incident.
+// It requires a CSRF token even though it performs no domain state change: it
+// writes an audit record and can trigger a billable LLM call, so a cross-site
+// request must not be able to invoke it. The browser SameSite policy is only
+// the first layer.
 func (s *Server) handleAnalyzeIncident(w http.ResponseWriter, r *http.Request) {
 	p := s.authenticate(w, r)
 	if p == nil {
@@ -51,6 +54,33 @@ func (s *Server) handleAnalyzeIncident(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePermission(w, r, p, authorization.PermRunAIAnalysis) {
 		return
 	}
+	if !s.requireCSRF(w, r, p) {
+		return
+	}
+
+	// Cost control: AI calls are billable and slow. Throttle per user and
+	// globally so one operator (or one compromised account) cannot turn
+	// analyze into an LLM cost DoS. Throttled callers get 429, not a fallback,
+	// so the client can distinguish "slow down" from "AI unavailable".
+	now := s.now()
+	userKey := "analyze:user:" + p.User.ID
+	if wait := s.analyzeLimiter.RetryAfter(userKey, now); wait > 0 {
+		s.reg.Inc(metrics.AIRateLimitedTotal)
+		w.Header().Set("Retry-After", formatSeconds(wait))
+		writeError(w, http.StatusTooManyRequests, CodeRateLimited, "too many analysis requests, try again later")
+		return
+	}
+	if wait := s.analyzeLimiter.RetryAfter("analyze:global", now); wait > 0 {
+		s.reg.Inc(metrics.AIRateLimitedTotal)
+		w.Header().Set("Retry-After", formatSeconds(wait))
+		writeError(w, http.StatusTooManyRequests, CodeRateLimited, "too many analysis requests, try again later")
+		return
+	}
+	// Count the attempt toward the quota, success or not: the LLM cost is
+	// incurred even when the provider later fails.
+	s.analyzeLimiter.Fail(userKey, now)
+	s.analyzeLimiter.Fail("analyze:global", now)
+	s.reg.Inc(metrics.AIRequestsTotal)
 
 	incidentID := r.PathValue("id")
 	inc, err := s.store.GetIncident(r.Context(), incidentID)

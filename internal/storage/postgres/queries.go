@@ -18,6 +18,7 @@ import (
 	"github.com/halimi/halimisoc/internal/events/model"
 	"github.com/halimi/halimisoc/internal/incidents"
 	"github.com/halimi/halimisoc/internal/storage"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 var (
@@ -499,17 +500,27 @@ func (s *Store) SaveUser(ctx context.Context, u *auth.User) error {
 	if u == nil {
 		return fmt.Errorf("postgres: nil user")
 	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO users (id, username, password_hash, role, disabled, created_at, last_login_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
+	backupJSON, err := json.Marshal(nonNilStrings(u.BackupHashes))
+	if err != nil {
+		return fmt.Errorf("postgres: marshal backup codes: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO users (id, username, password_hash, role, disabled, created_at, last_login_at,
+			totp_secret, totp_enabled, totp_enrolled_at, backup_codes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (id) DO UPDATE SET
 			username = EXCLUDED.username,
 			password_hash = EXCLUDED.password_hash,
 			role = EXCLUDED.role,
 			disabled = EXCLUDED.disabled,
-			last_login_at = EXCLUDED.last_login_at`,
+			last_login_at = EXCLUDED.last_login_at,
+			totp_secret = EXCLUDED.totp_secret,
+			totp_enabled = EXCLUDED.totp_enabled,
+			totp_enrolled_at = EXCLUDED.totp_enrolled_at,
+			backup_codes = EXCLUDED.backup_codes`,
 		u.ID, strings.ToLower(u.Username), u.PasswordHash, string(u.Role), u.Disabled,
 		u.CreatedAt.UTC(), u.LastLoginAt,
+		nullIfEmpty(u.TOTPSecret), u.TOTPEnabled, u.TOTPEnrolledAt, backupJSON,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -523,7 +534,8 @@ func (s *Store) SaveUser(ctx context.Context, u *auth.User) error {
 
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (*auth.User, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, disabled, created_at, last_login_at
+		SELECT id, username, password_hash, role, disabled, created_at, last_login_at,
+		       coalesce(totp_secret,''), coalesce(totp_enabled,false), totp_enrolled_at, coalesce(backup_codes,'[]'::jsonb)
 		FROM users WHERE lower(username) = lower($1)`, username)
 	u, err := scanUser(row)
 	if err != nil {
@@ -534,7 +546,8 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (*auth.U
 
 func (s *Store) GetUser(ctx context.Context, id string) (*auth.User, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, username, password_hash, role, disabled, created_at, last_login_at
+		SELECT id, username, password_hash, role, disabled, created_at, last_login_at,
+		       coalesce(totp_secret,''), coalesce(totp_enabled,false), totp_enrolled_at, coalesce(backup_codes,'[]'::jsonb)
 		FROM users WHERE id = $1`, id)
 	u, err := scanUser(row)
 	if err != nil {
@@ -554,7 +567,8 @@ func (s *Store) CountUsers(ctx context.Context) (int64, error) {
 // ListUsers returns every operator account ordered by username.
 func (s *Store) ListUsers(ctx context.Context) ([]*auth.User, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, username, password_hash, role, disabled, created_at, last_login_at
+		SELECT id, username, password_hash, role, disabled, created_at, last_login_at,
+		       coalesce(totp_secret,''), coalesce(totp_enabled,false), totp_enrolled_at, coalesce(backup_codes,'[]'::jsonb)
 		FROM users ORDER BY username`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list users: %w", err)
@@ -611,6 +625,17 @@ func (s *Store) GetSession(ctx context.Context, id string) (*auth.Session, error
 		return nil, mapNotFound(err)
 	}
 	return sess, nil
+}
+
+func (s *Store) TouchSession(ctx context.Context, id string, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE sessions SET last_seen_at = $1 WHERE id = $2 AND revoked_at IS NULL`, at.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("postgres: touch session: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) RevokeSession(ctx context.Context, id string, at time.Time) error {
@@ -826,6 +851,116 @@ func (s *Store) ListAudit(ctx context.Context, limit int, cursor string) ([]*aud
 	return out, next, rows.Err()
 }
 
+// --- Passkeys -------------------------------------------------------------
+
+func (s *Store) SavePasskey(ctx context.Context, p *webauthn.Passkey) error {
+	if p == nil {
+		return fmt.Errorf("postgres: nil passkey")
+	}
+	transports, err := json.Marshal(nonNilStrings(p.Transports))
+	if err != nil {
+		return fmt.Errorf("postgres: marshal transports: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO passkeys (id, user_id, credential_id, public_key, sign_count, transports, name, created_at, last_used_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		ON CONFLICT (id) DO UPDATE SET
+			sign_count = EXCLUDED.sign_count,
+			transports = EXCLUDED.transports,
+			name = EXCLUDED.name,
+			last_used_at = EXCLUDED.last_used_at`,
+		p.ID, p.UserID, p.CredentialID, p.PublicKey, int64(p.SignCount), transports,
+		nullIfEmpty(p.Name), p.CreatedAt.UTC(), p.LastUsedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return fmt.Errorf("%w: passkey already registered", storage.ErrConflict)
+		}
+		return fmt.Errorf("postgres: save passkey: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListPasskeysByUser(ctx context.Context, userID string) ([]*webauthn.Passkey, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, user_id, credential_id, public_key, sign_count, transports, coalesce(name,''), created_at, last_used_at
+		FROM passkeys WHERE user_id = $1 ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list passkeys: %w", err)
+	}
+	defer rows.Close()
+	var out []*webauthn.Passkey
+	for rows.Next() {
+		p, err := scanPasskey(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan passkey: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetPasskeyByCredentialID(ctx context.Context, credentialID string) (*webauthn.Passkey, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, user_id, credential_id, public_key, sign_count, transports, coalesce(name,''), created_at, last_used_at
+		FROM passkeys WHERE credential_id = $1`, credentialID)
+	p, err := scanPasskey(row)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return p, nil
+}
+
+func (s *Store) UpdatePasskeyCounter(ctx context.Context, id string, signCount uint32, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE passkeys SET sign_count = $1, last_used_at = $2 WHERE id = $3`,
+		int64(signCount), at.UTC(), id)
+	if err != nil {
+		return fmt.Errorf("postgres: update passkey: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeletePasskey(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM passkeys WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("postgres: delete passkey: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func scanPasskey(sc scanner) (*webauthn.Passkey, error) {
+	var (
+		p          webauthn.Passkey
+		signCount  int64
+		transports []byte
+		lastUsed   *time.Time
+	)
+	err := sc.Scan(&p.ID, &p.UserID, &p.CredentialID, &p.PublicKey, &signCount, &transports, &p.Name, &p.CreatedAt, &lastUsed)
+	if err != nil {
+		return nil, err
+	}
+	p.SignCount = uint32(signCount)
+	p.CreatedAt = p.CreatedAt.UTC()
+	if lastUsed != nil {
+		t := lastUsed.UTC()
+		p.LastUsedAt = &t
+	}
+	if len(transports) > 0 {
+		var t []string
+		if err := json.Unmarshal(transports, &t); err == nil {
+			p.Transports = t
+		}
+	}
+	return &p, nil
+}
+
 // --- Scanners -------------------------------------------------------------
 
 // scanner is satisfied by both pgx.Row and pgx.Rows.
@@ -936,8 +1071,11 @@ func scanUser(sc scanner) (*auth.User, error) {
 		u         auth.User
 		role      string
 		lastLogin *time.Time
+		enrolled  *time.Time
+		backups   []byte
 	)
-	err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &role, &u.Disabled, &u.CreatedAt, &lastLogin)
+	err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &role, &u.Disabled, &u.CreatedAt, &lastLogin,
+		&u.TOTPSecret, &u.TOTPEnabled, &enrolled, &backups)
 	if err != nil {
 		return nil, err
 	}
@@ -946,6 +1084,16 @@ func scanUser(sc scanner) (*auth.User, error) {
 	if lastLogin != nil {
 		t := lastLogin.UTC()
 		u.LastLoginAt = &t
+	}
+	if enrolled != nil {
+		t := enrolled.UTC()
+		u.TOTPEnrolledAt = &t
+	}
+	if len(backups) > 0 {
+		var hashes []string
+		if err := json.Unmarshal(backups, &hashes); err == nil {
+			u.BackupHashes = hashes
+		}
 	}
 	return &u, nil
 }

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -65,11 +67,24 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics renders the Prometheus exposition format.
 //
-// The endpoint is intentionally unauthenticated: it exposes counters and gauges
-// only, never event content or credentials. In a real deployment it is bound to
-// an internal interface or protected by the reverse proxy; that is documented in
-// docs/security rather than assumed.
+// The endpoint exposes counters and gauges only, never event content or
+// credentials. When MetricsToken is set it requires
+// Authorization: Bearer <token> (constant-time); otherwise it stays
+// unauthenticated and the reverse proxy must restrict it to the monitoring
+// network, as documented in docs/security/configuration.md.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.metricsToken != "" {
+		header := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		token := ""
+		if strings.HasPrefix(header, prefix) {
+			token = strings.TrimSpace(strings.TrimPrefix(header, prefix))
+		}
+		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.metricsToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, CodeUnauthorized, "authentication required")
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if err := s.reg.WritePrometheus(w); err != nil {

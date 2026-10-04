@@ -174,6 +174,9 @@ func (s *Server) sessionStillUsable(ctx context.Context, sessionID, userID strin
 	if !sess.Usable(now) {
 		return false
 	}
+	if sess.IdleExpired(now, s.sessionIdle) {
+		return false
+	}
 
 	user, err := s.store.GetUser(ctx, userID)
 	if err != nil || !user.Active() {

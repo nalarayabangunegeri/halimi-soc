@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -85,6 +86,9 @@ func NewOpenAICompatibleProvider(opts ProviderOptions) (*OpenAICompatibleProvide
 	if strings.TrimSpace(opts.Model) == "" {
 		return nil, fmt.Errorf("ai: provider model is required")
 	}
+	if err := validateProviderURL(opts.BaseURL); err != nil {
+		return nil, err
+	}
 	if opts.Name == "" {
 		opts.Name = opts.Model
 	}
@@ -110,6 +114,36 @@ func NewOpenAICompatibleProvider(opts ProviderOptions) (*OpenAICompatibleProvide
 
 // Name implements Provider.
 func (p *OpenAICompatibleProvider) Name() string { return p.name }
+
+// validateProviderURL fails closed on metadata endpoints and on cleartext
+// credentials over the network: an API key sent over plain http to a remote
+// host is sniffable. Loopback http (local Ollama-style servers) stays allowed.
+func validateProviderURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("ai: invalid provider base url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("ai: provider base url scheme must be http or https")
+	}
+	host := strings.ToLower(u.Hostname())
+	switch host {
+	case "169.254.169.254", "169.254.169.253", "metadata.google.internal", "metadata.google", "metadata":
+		return fmt.Errorf("ai: provider base url must not target cloud metadata")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(host) {
+		return fmt.Errorf("ai: provider base url must use https unless it is loopback")
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
 
 type chatMessage struct {
 	Role    string `json:"role"`

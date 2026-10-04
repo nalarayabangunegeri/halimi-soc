@@ -21,6 +21,7 @@ import (
 	"github.com/halimi/halimisoc/internal/events/model"
 	"github.com/halimi/halimisoc/internal/incidents"
 	"github.com/halimi/halimisoc/internal/storage"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 // Store is an in-memory Store.
@@ -35,6 +36,7 @@ type Store struct {
 	sessions  map[string]*auth.Session
 	incidents map[string]*incidents.Incident
 	audit     []*audit.Entry
+	passkeys  map[string]*webauthn.Passkey
 
 	// eventOrder preserves insertion order so pagination is stable even when
 	// two events share a timestamp.
@@ -51,6 +53,7 @@ func New() *Store {
 		users:     map[string]*auth.User{},
 		sessions:  map[string]*auth.Session{},
 		incidents: map[string]*incidents.Incident{},
+		passkeys:  map[string]*webauthn.Passkey{},
 	}
 }
 
@@ -427,6 +430,7 @@ func (s *Store) SaveUser(_ context.Context, u *auth.User) error {
 		}
 	}
 	cp := *u
+	cp.BackupHashes = append([]string(nil), u.BackupHashes...)
 	s.users[u.ID] = &cp
 	return nil
 }
@@ -437,6 +441,7 @@ func (s *Store) GetUserByUsername(_ context.Context, username string) (*auth.Use
 	for _, u := range s.users {
 		if strings.EqualFold(u.Username, username) {
 			cp := *u
+			cp.BackupHashes = append([]string(nil), u.BackupHashes...)
 			return &cp, nil
 		}
 	}
@@ -451,6 +456,7 @@ func (s *Store) GetUser(_ context.Context, id string) (*auth.User, error) {
 		return nil, storage.ErrNotFound
 	}
 	cp := *u
+	cp.BackupHashes = append([]string(nil), u.BackupHashes...)
 	return &cp, nil
 }
 
@@ -480,6 +486,7 @@ func (s *Store) ListUsers(_ context.Context) ([]*auth.User, error) {
 	out := make([]*auth.User, 0, len(s.users))
 	for _, u := range s.users {
 		cp := *u
+		cp.BackupHashes = append([]string(nil), u.BackupHashes...)
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
@@ -505,6 +512,17 @@ func (s *Store) GetSession(_ context.Context, id string) (*auth.Session, error) 
 	}
 	cp := *sess
 	return &cp, nil
+}
+
+func (s *Store) TouchSession(_ context.Context, id string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	sess.LastSeenAt = at.UTC()
+	return nil
 }
 
 func (s *Store) RevokeSession(_ context.Context, id string, at time.Time) error {
@@ -663,6 +681,76 @@ func (s *Store) ListAudit(_ context.Context, limit int, cursor string) ([]*audit
 func (s *Store) Ping(context.Context) error { return nil }
 
 func (s *Store) Close() error { return nil }
+
+// --- Passkeys -------------------------------------------------------------
+
+func (s *Store) SavePasskey(_ context.Context, p *webauthn.Passkey) error {
+	if p == nil {
+		return fmt.Errorf("memory: nil passkey")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.passkeys {
+		if existing.CredentialID == p.CredentialID && existing.ID != p.ID {
+			return fmt.Errorf("%w: passkey already registered", storage.ErrConflict)
+		}
+	}
+	cp := *p
+	cp.Transports = append([]string(nil), p.Transports...)
+	s.passkeys[p.ID] = &cp
+	return nil
+}
+
+func (s *Store) ListPasskeysByUser(_ context.Context, userID string) ([]*webauthn.Passkey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*webauthn.Passkey
+	for _, p := range s.passkeys {
+		if p.UserID == userID {
+			cp := *p
+			cp.Transports = append([]string(nil), p.Transports...)
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (s *Store) GetPasskeyByCredentialID(_ context.Context, credentialID string) (*webauthn.Passkey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.passkeys {
+		if p.CredentialID == credentialID {
+			cp := *p
+			cp.Transports = append([]string(nil), p.Transports...)
+			return &cp, nil
+		}
+	}
+	return nil, storage.ErrNotFound
+}
+
+func (s *Store) UpdatePasskeyCounter(_ context.Context, id string, signCount uint32, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.passkeys[id]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	p.SignCount = signCount
+	ts := at.UTC()
+	p.LastUsedAt = &ts
+	return nil
+}
+
+func (s *Store) DeletePasskey(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.passkeys[id]; !ok {
+		return storage.ErrNotFound
+	}
+	delete(s.passkeys, id)
+	return nil
+}
 
 // --- Cloning --------------------------------------------------------------
 

@@ -56,9 +56,30 @@ type enrollResponse struct {
 // constant time and its use is audited. The resulting per-agent token is what
 // authenticates ingestion, which means one compromised agent cannot be used to
 // impersonate another.
+//
+// Enrollment is rate-limited per source address and globally: without it the
+// shared secret is an online brute-force oracle. Failed attempts back off, a
+// success clears the source key.
 func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	if s.enrollSecret == "" {
 		writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "agent enrollment is not configured")
+		return
+	}
+
+	now := s.now()
+	ip := clientIP(r)
+	ipKey := "enroll:ip:" + ip
+	globalKey := "enroll:global"
+	if wait := s.limiter.RetryAfter(ipKey, now); wait > 0 {
+		s.reg.Inc(metrics.EnrollRateLimitedTotal)
+		w.Header().Set("Retry-After", formatSeconds(wait))
+		writeError(w, http.StatusTooManyRequests, CodeRateLimited, "too many attempts, try again later")
+		return
+	}
+	if wait := s.limiter.RetryAfter(globalKey, now); wait > 0 {
+		s.reg.Inc(metrics.EnrollRateLimitedTotal)
+		w.Header().Set("Retry-After", formatSeconds(wait))
+		writeError(w, http.StatusTooManyRequests, CodeRateLimited, "too many attempts, try again later")
 		return
 	}
 
@@ -69,6 +90,8 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !secret.EqualHash(secret.HashToken(req.EnrollmentSecret), secret.HashToken(s.enrollSecret)) {
+		s.limiter.Fail(ipKey, now)
+		s.limiter.Fail(globalKey, now)
 		s.writeAudit(r, audit.Entry{
 			Actor:    audit.ActorRef(audit.ActorSystem, "enrollment"),
 			Action:   audit.ActionAgentEnrolled,
@@ -96,7 +119,6 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := s.now()
 	agentID := id.New(id.KindAgent)
 
 	// Re-enrolling the same host replaces its identity rather than creating a
@@ -154,6 +176,7 @@ func (s *Server) handleRegisterAgent(w http.ResponseWriter, r *http.Request) {
 		Result:     audit.ResultSuccess,
 		Detail:     "host=" + host,
 	})
+	s.limiter.Succeed(ipKey)
 
 	writeJSON(w, http.StatusCreated, enrollResponse{
 		AgentID:    agentID,

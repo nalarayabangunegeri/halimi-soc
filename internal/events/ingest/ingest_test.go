@@ -286,3 +286,34 @@ func containsAny(s string, chars string) bool {
 	}
 	return false
 }
+
+// M4: ancient timestamps stay ingestible for backfill but are marked and
+// counted so a flood of backdated telemetry cannot evade correlation silently.
+func TestOldTimestampIsMarkedAndCounted(t *testing.T) {
+	ing, store, reg, now := build(t)
+	old := (*now).Add(-48 * time.Hour)
+	e := sshFailure(id.NewEvent(), "203.0.113.7", old)
+	res, err := ing.Ingest(context.Background(), []*model.Event{e})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted != 1 {
+		t.Fatalf("inserted = %d, want 1 (old events are accepted)", res.Inserted)
+	}
+	got, err := store.GetEvent(context.Background(), e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Attributes["timestamp_old"] != "true" {
+		t.Fatalf("attributes = %v, want timestamp_old=true marker", got.Attributes)
+	}
+	found := false
+	for k, v := range reg.Snapshot() {
+		if len(k) >= len(metrics.ClockSkewAnomalyTotal) && k[:len(metrics.ClockSkewAnomalyTotal)] == metrics.ClockSkewAnomalyTotal && v >= 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("old timestamp was not counted in clock_skew_anomaly_total")
+	}
+}

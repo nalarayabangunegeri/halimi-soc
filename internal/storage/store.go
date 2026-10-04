@@ -17,6 +17,7 @@ import (
 	"github.com/halimi/halimisoc/internal/auth"
 	"github.com/halimi/halimisoc/internal/events/model"
 	"github.com/halimi/halimisoc/internal/incidents"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 // Errors returned by every implementation.
@@ -116,6 +117,7 @@ type Store interface {
 	// Sessions.
 	SaveSession(ctx context.Context, s *auth.Session) error
 	GetSession(ctx context.Context, id string) (*auth.Session, error)
+	TouchSession(ctx context.Context, id string, at time.Time) error
 	RevokeSession(ctx context.Context, id string, at time.Time) error
 	RevokeUserSessions(ctx context.Context, userID string, at time.Time) error
 	DeleteExpiredSessions(ctx context.Context, now time.Time) (int, error)
@@ -129,6 +131,13 @@ type Store interface {
 	// Audit.
 	AppendAudit(ctx context.Context, e *audit.Entry) error
 	ListAudit(ctx context.Context, limit int, cursor string) ([]*audit.Entry, string, error)
+
+	// Passkeys (WebAuthn).
+	SavePasskey(ctx context.Context, p *webauthn.Passkey) error
+	ListPasskeysByUser(ctx context.Context, userID string) ([]*webauthn.Passkey, error)
+	GetPasskeyByCredentialID(ctx context.Context, credentialID string) (*webauthn.Passkey, error)
+	UpdatePasskeyCounter(ctx context.Context, id string, signCount uint32, at time.Time) error
+	DeletePasskey(ctx context.Context, id string) error
 
 	// Lifecycle.
 	Ping(ctx context.Context) error

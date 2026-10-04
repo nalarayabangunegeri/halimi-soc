@@ -240,3 +240,100 @@ func TestInvalidWebhookURLFailsClosed(t *testing.T) {
 		t.Errorf("valid webhook url rejected: %v", err)
 	}
 }
+
+func TestSessionIdleBoundsAreEnforced(t *testing.T) {
+	base := func() *config.Config {
+		return &config.Config{
+			Environment: "development",
+			ListenAddr:  "127.0.0.1:8080",
+			SessionTTL:  time.Hour,
+			SessionIdle: 30 * time.Minute,
+			ClockSkew:   5 * time.Minute,
+			Retention:   config.DefaultLimits(),
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("valid idle rejected: %v", err)
+	}
+
+	short := base()
+	short.SessionIdle = time.Minute
+	if err := short.Validate(); err == nil {
+		t.Error("idle below the minimum accepted")
+	}
+
+	// An idle window longer than the absolute TTL is dead configuration.
+	long := base()
+	long.SessionIdle = 2 * time.Hour
+	if err := long.Validate(); err == nil {
+		t.Error("idle exceeding ttl accepted")
+	}
+}
+
+func TestWebAuthnOriginsFailClosedInProduction(t *testing.T) {
+	base := func() *config.Config {
+		return &config.Config{
+			Environment:       "production",
+			ListenAddr:        "127.0.0.1:8080",
+			SessionTTL:        time.Hour,
+			ClockSkew:         5 * time.Minute,
+			Retention:         config.DefaultLimits(),
+			AdminPassword:     "a-sufficiently-long-password",
+			AgentEnrollSecret: "a-sufficiently-long-enrollment-secret",
+			SecureCookies:     true,
+			WebAuthnRPID:      "soc.example.test",
+			WebAuthnOrigins:   []string{"https://soc.example.test"},
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("valid production webauthn rejected: %v", err)
+	}
+
+	cleartext := base()
+	cleartext.WebAuthnOrigins = []string{"http://soc.example.test"}
+	if err := cleartext.Validate(); err == nil {
+		t.Error("cleartext non-loopback origin accepted in production")
+	}
+
+	// Loopback http stays allowed for lab deployments.
+	lab := base()
+	lab.WebAuthnRPID = "127.0.0.1"
+	lab.WebAuthnOrigins = []string{"http://127.0.0.1:3000"}
+	if err := lab.Validate(); err != nil {
+		t.Errorf("loopback origin rejected: %v", err)
+	}
+
+	bare := base()
+	bare.WebAuthnRPID = "soc.example.test:3000"
+	if err := bare.Validate(); err == nil {
+		t.Error("rp id with port accepted")
+	}
+}
+
+func TestLoadReadsHardeningSettings(t *testing.T) {
+	t.Setenv("HALIMISOC_SESSION_IDLE", "90m")
+	t.Setenv("HALIMISOC_METRICS_TOKEN", "metrics-token-value")
+	t.Setenv("HALIMISOC_MFA_KEY", "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlBQkNERUY=")
+	t.Setenv("HALIMISOC_WEBAUTHN_RP_ID", "soc.example.test")
+	t.Setenv("HALIMISOC_WEBAUTHN_ORIGINS", "https://soc.example.test")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if cfg.SessionIdle != 90*time.Minute {
+		t.Errorf("session idle = %s", cfg.SessionIdle)
+	}
+	if cfg.MetricsToken != "metrics-token-value" {
+		t.Errorf("metrics token = %q", cfg.MetricsToken)
+	}
+	if cfg.MFAKeyRaw == "" {
+		t.Error("mfa key not loaded")
+	}
+	if cfg.WebauthnConfig().RPID != "soc.example.test" {
+		t.Errorf("rp id = %q", cfg.WebauthnConfig().RPID)
+	}
+	if len(cfg.WebauthnConfig().Origins) != 1 {
+		t.Errorf("origins = %v", cfg.WebauthnConfig().Origins)
+	}
+}

@@ -36,10 +36,12 @@ import (
 	"github.com/halimi/halimisoc/internal/events/validation"
 	"github.com/halimi/halimisoc/internal/id"
 	"github.com/halimi/halimisoc/internal/metrics"
+	"github.com/halimi/halimisoc/internal/mfa"
 	"github.com/halimi/halimisoc/internal/notify"
 	"github.com/halimi/halimisoc/internal/storage"
 	"github.com/halimi/halimisoc/internal/storage/memory"
 	"github.com/halimi/halimisoc/internal/storage/postgres"
+	"github.com/halimi/halimisoc/internal/webauthn"
 )
 
 //go:embed migrations/*.sql
@@ -64,6 +66,10 @@ func run() error {
 	}
 
 	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("configuration: %w", err)
+	}
+	mfaKey, err := mfa.ParseMFAKey(cfg.MFAKeyRaw)
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
@@ -113,6 +119,17 @@ func run() error {
 	notifier.SetRegistry(reg)
 	if notifier.Enabled() {
 		log.Info("incident webhook enabled")
+		if cfg.WebhookSecret == "" {
+			log.Warn("webhook signing disabled: set HALIMISOC_WEBHOOK_SECRET so receivers can verify X-HalimiSOC-Signature")
+		}
+	}
+	if cfg.MetricsToken == "" {
+		log.Warn("metrics token unset: /metrics is unauthenticated, restrict it at the reverse proxy or set HALIMISOC_METRICS_TOKEN")
+	}
+	if len(mfaKey) == 0 {
+		log.Warn("mfa key unset: TOTP secrets are stored with a plain: prefix; set HALIMISOC_MFA_KEY (base64 32 bytes) in production")
+	} else if cfg.IsProduction() {
+		log.Info("mfa at-rest encryption enabled")
 	}
 
 	validationOpts := validation.DefaultOptions()
@@ -132,6 +149,7 @@ func run() error {
 		Notifier:      notifier,
 		Limits:        cfg.Retention,
 		SessionTTL:    cfg.SessionTTL,
+		SessionIdle:   cfg.SessionIdle,
 		ClockSkew:     cfg.ClockSkew,
 		Logger:        log,
 		Metrics:       reg,
@@ -139,7 +157,14 @@ func run() error {
 		EnrollSecret:  cfg.AgentEnrollSecret,
 		Version:       version,
 		SecureCookies: cfg.SecureCookies,
-		RulesPath:     cfg.RulesPath,
+		MetricsToken:  cfg.MetricsToken,
+		MFAKey:        mfaKey,
+		WebAuthn: webauthn.Config{
+			RPID:    cfg.WebauthnConfig().RPID,
+			RPName:  cfg.WebauthnConfig().RPName,
+			Origins: cfg.WebauthnConfig().Origins,
+		},
+		RulesPath: cfg.RulesPath,
 	})
 
 	// The server is the publisher, so ingestion announces alerts and incidents
@@ -228,21 +253,34 @@ func openStore(ctx context.Context, cfg *config.Config, log *slog.Logger) (stora
 // It refuses to invent a password. A shipped default credential is the single
 // most common way a self-hosted security tool is compromised, so the operator
 // must supply one and the process fails closed without it.
+//
+// Recovery: if every administrator is disabled (or none exists) the process
+// creates a new admin from HALIMISOC_ADMIN_PASSWORD instead of leaving the
+// deployment permanently locked out. This is break-glass, not a backdoor: it
+// still requires the operator-controlled env secret and is audited.
 func bootstrap(ctx context.Context, cfg *config.Config, store storage.Store, log *slog.Logger) error {
-	count, err := store.CountUsers(ctx)
+	users, err := store.ListUsers(ctx)
 	if err != nil {
-		return fmt.Errorf("count users: %w", err)
+		return fmt.Errorf("list users: %w", err)
 	}
-	if count > 0 {
-		return nil
+	for _, u := range users {
+		if u.Role == authorization.RoleAdmin && u.Active() {
+			return nil
+		}
+	}
+	if len(users) > 0 {
+		log.Warn("no active administrator remains; bootstrap will create a recovery admin")
 	}
 
 	if cfg.AdminPassword == "" {
 		return errors.New("no operator accounts exist and HALIMISOC_ADMIN_PASSWORD is not set; " +
 			"set it to create the initial admin account")
 	}
-	if len(cfg.AdminPassword) < 12 {
+	if len(cfg.AdminPassword) < auth.MinPasswordLength {
 		return errors.New("HALIMISOC_ADMIN_PASSWORD must be at least 12 characters")
+	}
+	if len(cfg.AdminPassword) > auth.MaxPasswordLength {
+		return errors.New("HALIMISOC_ADMIN_PASSWORD must not exceed 128 characters")
 	}
 
 	hash, err := auth.HashPassword(cfg.AdminPassword)
@@ -316,6 +354,7 @@ func describeMetrics(reg *metrics.Registry) {
 	reg.Describe(metrics.EventsDroppedTotal, "Events rejected during validation")
 	reg.Describe(metrics.EventsDuplicateTotal, "Idempotent replay duplicates suppressed")
 	reg.Describe(metrics.DetectionTotal, "Alerts produced by deterministic detection")
+	reg.Describe(metrics.DetectionSuppressedTotal, "Alerts suppressed by cooldown (still correlated)")
 	reg.Describe(metrics.IncidentCreatedTotal, "Incidents created by correlation")
 	reg.Describe(metrics.WebhookSentTotal, "Incident webhooks delivered")
 	reg.Describe(metrics.WebhookErrorTotal, "Incident webhook delivery failures")
@@ -323,6 +362,10 @@ func describeMetrics(reg *metrics.Registry) {
 	reg.Describe(metrics.CorrelationMergeTotal, "Alerts merged into an existing incident")
 	reg.Describe(metrics.AgentLastHeartbeat, "Unix time of the most recent agent heartbeat")
 	reg.Describe(metrics.DetectionStateSize, "Tracked detection windows")
+	reg.Describe(metrics.AIRequestsTotal, "AI analysis requests (throttled quota)")
+	reg.Describe(metrics.AIRateLimitedTotal, "AI analysis requests rejected at the quota")
+	reg.Describe(metrics.EnrollRateLimitedTotal, "Agent enrollment attempts rejected at the quota")
+	reg.Describe(metrics.ClockSkewAnomalyTotal, "Old/future timestamp anomalies (old>24h marked timestamp_old)")
 }
 
 // buildAnalyst constructs the optional AI analyst.
@@ -354,5 +397,6 @@ func buildAnalyst(cfg *config.Config, log *slog.Logger) (*ai.Analyst, error) {
 	return ai.New(ai.Options{
 		Provider:         provider,
 		MaxResponseBytes: int(cfg.Retention.AIContextBytes.Default),
+		MaxConcurrent:    int(cfg.Retention.AIConcurrent.Default),
 	}), nil
 }

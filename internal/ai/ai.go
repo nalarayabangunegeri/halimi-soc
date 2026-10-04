@@ -145,6 +145,11 @@ type Analyst struct {
 
 	// MaxEvidenceItems bounds how many records are sent as context.
 	MaxEvidenceItems int
+
+	// MaxConcurrent bounds simultaneous provider calls. Zero means DefaultOptions.
+	MaxConcurrent int
+
+	sem chan struct{}
 }
 
 // Options configures an Analyst.
@@ -152,6 +157,7 @@ type Options struct {
 	Provider         Provider
 	MaxResponseBytes int
 	MaxEvidenceItems int
+	MaxConcurrent    int
 }
 
 // DefaultOptions returns the shipped bounds.
@@ -159,6 +165,7 @@ func DefaultOptions() Options {
 	return Options{
 		MaxResponseBytes: 8 << 10,
 		MaxEvidenceItems: 100,
+		MaxConcurrent:    2,
 	}
 }
 
@@ -171,11 +178,16 @@ func New(opts Options) *Analyst {
 	if opts.MaxEvidenceItems <= 0 {
 		opts.MaxEvidenceItems = def.MaxEvidenceItems
 	}
+	if opts.MaxConcurrent <= 0 {
+		opts.MaxConcurrent = def.MaxConcurrent
+	}
 	return &Analyst{
 		provider:         opts.Provider,
 		now:              func() time.Time { return time.Now().UTC() },
 		MaxResponseBytes: opts.MaxResponseBytes,
 		MaxEvidenceItems: opts.MaxEvidenceItems,
+		MaxConcurrent:    opts.MaxConcurrent,
+		sem:              make(chan struct{}, opts.MaxConcurrent),
 	}
 }
 
@@ -200,6 +212,16 @@ func (a *Analyst) Analyze(ctx context.Context, req Request) (Result, error) {
 
 	if a.provider == nil {
 		return Fallback(req.Incident, evidence), nil
+	}
+
+	// Bound concurrent provider calls: without this any authenticated role
+	// (including READONLY) can spam analyze into an LLM cost/latency DoS.
+	// Fail fast to the deterministic fallback instead of queueing unbounded.
+	select {
+	case a.sem <- struct{}{}:
+		defer func() { <-a.sem }()
+	default:
+		return Result{Mode: ModeUnavailable, Grounded: false}, nil
 	}
 
 	prompt := BuildPrompt(req.Incident, evidence)

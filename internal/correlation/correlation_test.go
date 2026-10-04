@@ -348,3 +348,29 @@ func TestStageForCoversShippedRules(t *testing.T) {
 		t.Errorf("StageFor(unknown) = %s, want UNKNOWN", got)
 	}
 }
+
+// An attacker who changes hosts, addresses and accounts between stages shares
+// no concrete entity with the first incident, so the engine honestly opens a
+// second one instead of inventing a chain out of time proximity.
+func TestRotatedInfrastructureStartsNewIncident(t *testing.T) {
+	store := memorystore.New()
+	eng := correlation.NewEngine(store, metrics.New())
+
+	base := time.Now().UTC()
+	eng.SetClock(func() time.Time { return base })
+
+	first, err := eng.Process(context.Background(), alert("alt_1", "ssh-bruteforce", "web-01", "root", "203.0.113.7", model.SeverityHigh, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := eng.Process(context.Background(), alert("alt_2", "ssh-login-after-bruteforce", "db-01", "deploy", "198.51.100.9", model.SeverityCritical, base.Add(time.Minute)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Created {
+		t.Fatal("rotated infrastructure merged; expected a second incident")
+	}
+	if second.Incident.ID == first.Incident.ID {
+		t.Fatal("distinct attacks share one incident id")
+	}
+}

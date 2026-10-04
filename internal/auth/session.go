@@ -51,6 +51,13 @@ type User struct {
 
 	CreatedAt   time.Time  `json:"created_at"`
 	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
+
+	// MFA. TOTPSecret is sealed ("v1:..." or "plain:...") and never
+	// serialised; BackupHashes are SHA-256 hex of single-use recovery codes.
+	TOTPSecret     string     `json:"-"`
+	TOTPEnabled    bool       `json:"mfa_enabled"`
+	TOTPEnrolledAt *time.Time `json:"mfa_enrolled_at,omitempty"`
+	BackupHashes   []string   `json:"-"`
 }
 
 // Active reports whether the account may authenticate.
@@ -79,6 +86,19 @@ func (s *Session) Revoked() bool { return s.RevokedAt != nil }
 
 // Expired reports whether the session has passed its expiry.
 func (s *Session) Expired(now time.Time) bool { return !now.Before(s.ExpiresAt) }
+
+// IdleExpired reports whether the session has been unused longer than idle.
+// A zero idle disables the check. Idle timeout bounds the window in which a
+// stolen cookie is useful even when the absolute TTL is long.
+func (s *Session) IdleExpired(now time.Time, idle time.Duration) bool {
+	if idle <= 0 {
+		return false
+	}
+	if s.LastSeenAt.IsZero() {
+		return false
+	}
+	return now.Sub(s.LastSeenAt) > idle
+}
 
 // Usable reports whether the session may authenticate at time now.
 func (s *Session) Usable(now time.Time) bool {

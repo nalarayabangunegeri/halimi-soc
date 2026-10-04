@@ -34,6 +34,18 @@ const (
 	ActionAIAnalysisRequested   Action = "AI_ANALYSIS_REQUESTED"
 	ActionUserCreated           Action = "USER_CREATED"
 	ActionUserDisabled          Action = "USER_DISABLED"
+	ActionUserPasswordChanged   Action = "USER_PASSWORD_CHANGED"
+	ActionUserPasswordReset     Action = "USER_PASSWORD_RESET"
+	ActionMFARequested          Action = "MFA_SETUP_REQUESTED"
+	ActionMFAEnabled            Action = "MFA_ENABLED"
+	ActionMFADisabled           Action = "MFA_DISABLED"
+	ActionMFAReset              Action = "MFA_RESET"
+	ActionMFALoginFailure       Action = "MFA_LOGIN_FAILURE"
+	ActionMFABackupUsed         Action = "MFA_BACKUP_USED"
+	ActionPasskeyRegistered     Action = "PASSKEY_REGISTERED"
+	ActionPasskeyDeleted        Action = "PASSKEY_DELETED"
+	ActionPasskeyLoginSuccess   Action = "PASSKEY_LOGIN_SUCCESS"
+	ActionPasskeyLoginFailure   Action = "PASSKEY_LOGIN_FAILURE"
 	ActionBootstrapAdmin        Action = "BOOTSTRAP_ADMIN"
 )
 

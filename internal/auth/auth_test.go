@@ -352,3 +352,139 @@ func TestRolePermissionsAreFailClosed(t *testing.T) {
 		t.Error("analyst must not manage detection rules")
 	}
 }
+
+func TestHashPasswordEnforcesLengthBounds(t *testing.T) {
+	if _, err := auth.HashPassword(""); err == nil {
+		t.Error("empty password accepted")
+	}
+	if _, err := auth.HashPassword("short-11-ch"); err == nil {
+		t.Error("11-char password accepted; minimum is 12")
+	}
+	if _, err := auth.HashPassword("twelve-chars"); err != nil {
+		t.Errorf("12-char password rejected: %v", err)
+	}
+	long := string(make([]byte, auth.MaxPasswordLength+1))
+	for i := range []byte(long) {
+		long = long[:i] + "a" + long[i+1:]
+	}
+	if _, err := auth.HashPassword(long); err == nil {
+		t.Error("overlong password hashed; must be rejected before Argon2id work")
+	}
+}
+
+func TestVerifyPasswordFastRejectsOverlong(t *testing.T) {
+	hash, err := auth.HashPassword("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := ""
+	for i := 0; i < auth.MaxPasswordLength+1; i++ {
+		long += "a"
+	}
+	ok, err := auth.VerifyPassword(long, hash)
+	if err != nil {
+		t.Fatalf("overlong verify returned an error (must be a cheap non-match): %v", err)
+	}
+	if ok {
+		t.Fatal("overlong password verified")
+	}
+}
+
+func TestNeedsRehashFlagsWeakAndCorrupt(t *testing.T) {
+	hash, err := auth.HashPassword("correct-horse-battery-staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.NeedsRehash(hash) {
+		t.Error("fresh hash flagged for rehash")
+	}
+	if !auth.NeedsRehash("not-a-hash") {
+		t.Error("corrupt hash not flagged for rehash")
+	}
+}
+
+func TestUserActiveAndSessionUsable(t *testing.T) {
+	now := time.Now().UTC()
+	u := &auth.User{Username: "admin"}
+	if !u.Active() {
+		t.Error("enabled user reported inactive")
+	}
+	u.Disabled = true
+	if u.Active() {
+		t.Error("disabled user reported active")
+	}
+
+	sess, _, err := auth.NewSession("usr_1", "", "", time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sess.Usable(now) {
+		t.Error("fresh session not usable")
+	}
+	revoked := *sess
+	ts := now
+	revoked.RevokedAt = &ts
+	if revoked.Usable(now) {
+		t.Error("revoked session usable")
+	}
+	expired, _, err := auth.NewSession("usr_1", "", "", time.Hour, now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired.Usable(now) {
+		t.Error("expired session usable")
+	}
+}
+
+func TestIdleExpiryBoundsStolenCookies(t *testing.T) {
+	now := time.Now().UTC()
+	sess, _, err := auth.NewSession("usr_1", "", "", 12*time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero idle disables the check: absolute TTL decides alone.
+	if sess.IdleExpired(now.Add(time.Hour), 0) {
+		t.Error("zero idle must disable the check")
+	}
+	// Fresh activity is fine.
+	if sess.IdleExpired(now.Add(time.Minute), 2*time.Hour) {
+		t.Error("fresh session reported idle-expired")
+	}
+	// A session unused beyond the idle window is dead even with TTL left.
+	stale, _, err := auth.NewSession("usr_1", "", "", 12*time.Hour, now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stale.IdleExpired(now, 2*time.Hour) {
+		t.Error("3h-idle session with 2h bound not expired")
+	}
+}
+
+func TestLimiterPrunesExpiredEntries(t *testing.T) {
+	opts := auth.DefaultLimiterOptions()
+	opts.ResetAfter = 50 * time.Millisecond
+	l := auth.NewLimiter(opts)
+	now := time.Now().UTC()
+	l.Fail("acct:prune", now)
+	if l.Size() != 1 {
+		t.Fatalf("size = %d, want 1", l.Size())
+	}
+	l.Prune(now.Add(2 * opts.ResetAfter))
+	if l.Size() != 0 {
+		t.Fatalf("size after prune = %d, want 0", l.Size())
+	}
+}
+
+func TestNewSessionTruncatesLongUserAgent(t *testing.T) {
+	long := ""
+	for i := 0; i < 300; i++ {
+		long += "a"
+	}
+	sess, _, err := auth.NewSession("usr_1", "", long, time.Hour, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sess.UserAgent) > 256 {
+		t.Fatalf("user agent = %d bytes, want <= 256", len(sess.UserAgent))
+	}
+}
